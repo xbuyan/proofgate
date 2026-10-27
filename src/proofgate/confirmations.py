@@ -1,0 +1,188 @@
+"""Server-issued, single-use confirmation tokens.
+
+Each token is bound to one :class:`Binding` of ``(action, arg_hash,
+policy_version)``. Redemption checks, in order: existence, single-use,
+expiry, policy-version match, then action/argument match. Comparisons use
+constant-time digest comparison.
+
+Only an 8-character ``token_id`` prefix is ever logged; the full token is
+returned to the caller alone. Time comes from an injectable clock
+(default ``time.time``); redemption at or past ``expires_at`` is expired.
+"""
+
+import hmac
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+
+__all__ = [
+    "Binding",
+    "ConfirmationError",
+    "ConfirmationStore",
+    "DEFAULT_TTL_SECONDS",
+    "REASON_INVALID",
+    "REASON_REUSED",
+    "REASON_EXPIRED",
+    "REASON_MISMATCH",
+    "REASON_SUPERSEDED",
+]
+
+DEFAULT_TTL_SECONDS = 300
+
+REASON_INVALID = "invalid_confirmation"
+REASON_REUSED = "confirmation_reused"
+REASON_EXPIRED = "confirmation_expired"
+REASON_MISMATCH = "confirmation_mismatch"
+REASON_SUPERSEDED = "policy_superseded"
+
+
+class ConfirmationError(Exception):
+    """Redemption failure; ``reason`` is the machine-readable code."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class Binding:
+    """Exact (action, canonical-argument hash, policy version) binding."""
+
+    action: str
+    arg_hash: str
+    policy_version: str
+
+
+@dataclass
+class _Entry:
+    binding: Binding
+    issued_at: float
+    expires_at: float
+    used: bool = False
+
+
+def _eq(a, b):
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except (AttributeError, TypeError):
+        return False
+
+
+class ConfirmationStore:
+    """Issues and redeems single-use confirmation tokens."""
+
+    def __init__(self, ttl_seconds=DEFAULT_TTL_SECONDS, clock=None):
+        if isinstance(ttl_seconds, bool) or not isinstance(
+            ttl_seconds, (int, float)
+        ) or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive number")
+        self._ttl = ttl_seconds
+        self._clock = clock or time.time
+        self._lock = threading.Lock()
+        self._entries = {}
+
+    @staticmethod
+    def token_id(token):
+        """Return the log-safe 8-character prefix of *token*."""
+        return token[:8]
+
+    def issue(self, action, arg_hash, policy_version):
+        """Issue a token bound to the given action, arg hash, and version."""
+        now = self._clock()
+        with self._lock:
+            token = secrets.token_urlsafe(32)
+            while token in self._entries:
+                token = secrets.token_urlsafe(32)
+            self._entries[token] = _Entry(
+                binding=Binding(action, arg_hash, policy_version),
+                issued_at=now,
+                expires_at=now + self._ttl,
+            )
+        return token
+
+    def redeem(self, token, action, arg_hash, policy_version):
+        """Redeem *token* or raise ConfirmationError with the reason code."""
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(token)
+            if entry is None:
+                raise ConfirmationError(REASON_INVALID)
+            if entry.used:
+                raise ConfirmationError(REASON_REUSED)
+            if now >= entry.expires_at:
+                raise ConfirmationError(REASON_EXPIRED)
+            if not _eq(entry.binding.policy_version, policy_version):
+                raise ConfirmationError(REASON_SUPERSEDED)
+            if not (
+                _eq(entry.binding.action, action)
+                and _eq(entry.binding.arg_hash, arg_hash)
+            ):
+                raise ConfirmationError(REASON_MISMATCH)
+            entry.used = True
+            return entry.binding
+
+    def check(self, token, action, arg_hash, policy_version):
+        """Validate *token* without consuming it; return the binding.
+
+        Same checks and reason codes as :meth:`redeem`, but the token
+        stays usable. The gate calls this before policy revalidation so
+        pre-execution rejections never consume a confirmation.
+        """
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(token)
+            if entry is None:
+                raise ConfirmationError(REASON_INVALID)
+            if entry.used:
+                raise ConfirmationError(REASON_REUSED)
+            if now >= entry.expires_at:
+                raise ConfirmationError(REASON_EXPIRED)
+            if not _eq(entry.binding.policy_version, policy_version):
+                raise ConfirmationError(REASON_SUPERSEDED)
+            if not (
+                _eq(entry.binding.action, action)
+                and _eq(entry.binding.arg_hash, arg_hash)
+            ):
+                raise ConfirmationError(REASON_MISMATCH)
+            return entry.binding
+
+    def consume(self, token):
+        """Mark *token* used; call only after a successful :meth:`check`.
+
+        Raises only when the entry is missing or already used, which is
+        unreachable when the gate serializes check-then-consume under its
+        lock; the gate treats any such failure defensively.
+        """
+        with self._lock:
+            entry = self._entries.get(token)
+            if entry is None:
+                raise ConfirmationError(REASON_INVALID)
+            if entry.used:
+                raise ConfirmationError(REASON_REUSED)
+            entry.used = True
+            return entry.binding
+
+    def purge_version(self, policy_version):
+        """Drop all tokens bound to *policy_version*; return the count."""
+        with self._lock:
+            doomed = [
+                token
+                for token, entry in self._entries.items()
+                if entry.binding.policy_version == policy_version
+            ]
+            for token in doomed:
+                del self._entries[token]
+            return len(doomed)
+
+    def clear(self):
+        """Drop all tokens; return the count removed."""
+        with self._lock:
+            count = len(self._entries)
+            self._entries.clear()
+            return count
+
+    def pending_count(self):
+        """Return the number of stored (used or unused) tokens."""
+        with self._lock:
+            return len(self._entries)
