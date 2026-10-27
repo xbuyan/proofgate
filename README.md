@@ -179,6 +179,14 @@ the same Python process (no memory isolation exists there), the host clock
 crash recovery, and authenticated caller identity
 (`actor` is a self-asserted label).
 
+`KeyboardInterrupt` and `SystemExit` raised during a gate call can
+propagate without a response. Because ProofGate currently uses in-memory
+state, an embedding host that catches such an exception must not assume
+the call either succeeded or failed cleanly. It must treat the gate's
+state as suspect, run the available health/reconciliation checks, and
+stop using or reconstruct the instance if consistency cannot be
+established.
+
 ## Limitations (explicit non-claims)
 
 In-memory state only; no crash durability — a process crash loses the
