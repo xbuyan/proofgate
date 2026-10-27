@@ -14,6 +14,7 @@ envelope time ``expires_at`` is expired.
 """
 
 import hmac
+import math
 import secrets
 import threading
 import time
@@ -78,7 +79,7 @@ class ConfirmationStore:
     def __init__(self, ttl_seconds=DEFAULT_TTL_SECONDS, clock=None):
         if isinstance(ttl_seconds, bool) or not isinstance(
             ttl_seconds, (int, float)
-        ) or ttl_seconds <= 0:
+        ) or ttl_seconds <= 0 or not math.isfinite(ttl_seconds):
             raise ValueError("ttl_seconds must be a positive number")
         self._ttl = ttl_seconds
         self._clock = clock or time.monotonic

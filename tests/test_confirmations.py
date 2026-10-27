@@ -155,6 +155,18 @@ class ConfirmationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ConfirmationStore(ttl_seconds=0)
 
+    def test_nonfinite_ttl_rejected(self):
+        with self.assertRaises(ValueError):
+            ConfirmationStore(ttl_seconds=float("inf"))
+        with self.assertRaises(ValueError):
+            ConfirmationStore(ttl_seconds=float("nan"))
+
+    def test_large_finite_ttl_accepted(self):
+        store = ConfirmationStore(ttl_seconds=1e308)
+        token = store.issue("transfer_money", "h", "v1")
+        binding = store.check(token, "transfer_money", "h", "v1")
+        self.assertEqual(binding.policy_version, "v1")
+
     def test_check_does_not_consume(self):
         token = self.issue()
         binding = self.store.check(token, "transfer_money", "h", "v1")
