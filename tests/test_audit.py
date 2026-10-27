@@ -264,5 +264,45 @@ class AuditCorrespondenceTests(unittest.TestCase):
         self.assertEqual(len(gate.audit_records()), 6)
 
 
+class ReturnedCopyIsolationTests(unittest.TestCase):
+    """Returned records share no mutable state with the log (F5)."""
+
+    def test_records_extra_isolated(self):
+        log = AuditLog(initial_policy_version="v1")
+        decision(log, extra={"journal_seq": 1, "tags": ["x"]})
+        snapshot = log.records
+        snapshot[1]["extra"]["journal_seq"] = 999
+        snapshot[1]["extra"]["tags"].append("forged")
+        snapshot[1]["extra"]["new_key"] = True
+        stored = log.records[1]
+        self.assertEqual(
+            stored["extra"], {"journal_seq": 1, "tags": ["x"]}
+        )
+        ok, _ = log.verify()
+        self.assertTrue(ok)
+
+    def test_append_return_extra_isolated(self):
+        log = AuditLog(initial_policy_version="v1")
+        returned = decision(log, extra={"tags": ["x"]})
+        returned["extra"]["tags"].append("forged")
+        returned["extra"]["new_key"] = True
+        stored = log.records[1]
+        self.assertEqual(stored["extra"], {"tags": ["x"]})
+        ok, _ = log.verify()
+        self.assertTrue(ok)
+
+    def test_append_copies_caller_extra(self):
+        log = AuditLog(initial_policy_version="v1")
+        owned = {"tags": ["x"]}
+        decision(log, extra=owned)
+        owned["tags"].append("forged")
+        owned["new_key"] = True
+        # Index 1: index 0 is the genesis record appended in __init__.
+        stored = log.records[1]
+        self.assertEqual(stored["extra"], {"tags": ["x"]})
+        ok, _ = log.verify()
+        self.assertTrue(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

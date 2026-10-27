@@ -19,6 +19,7 @@ process crash loses it. ``fault_hook`` is a test-only injection point
 that may raise :class:`AuditError` to simulate a write failure.
 """
 
+import copy
 import hashlib
 import hmac
 import json
@@ -132,8 +133,12 @@ class AuditLog:
 
     @property
     def records(self):
-        """Return copies of the records (callers cannot mutate the log)."""
-        return tuple(dict(record) for record in self._records)
+        """Return copies of the records (callers cannot mutate the log).
+
+        Copies are deep: ``extra`` imposes no value schema, so only a
+        deep copy provably isolates every nested mutable value.
+        """
+        return tuple(copy.deepcopy(record) for record in self._records)
 
     def __len__(self):
         return len(self._records)
@@ -180,7 +185,7 @@ class AuditLog:
             "decision": decision,
             "reason": reason,
             "token_id": token_id,
-            "extra": dict(extra) if extra else {},
+            "extra": copy.deepcopy(extra) if extra else {},
             "prev_hash": prev_hash,
         }
         record_hash = _record_hash(body)
@@ -191,7 +196,7 @@ class AuditLog:
                 "audit_corrupt", {"problem": "self_check"}
             )
         self._records.append(record)
-        return dict(record)
+        return copy.deepcopy(record)
 
     def verify(self):
         """Return ``(ok, detail)`` for the full chain check."""
