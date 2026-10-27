@@ -6,8 +6,11 @@ expiry, policy-version match, then action/argument match. Comparisons use
 constant-time digest comparison.
 
 Only an 8-character ``token_id`` prefix is ever logged; the full token is
-returned to the caller alone. Time comes from an injectable clock
-(default ``time.time``); redemption at or past ``expires_at`` is expired.
+returned to the caller alone. TTL comparisons use a monotonic envelope
+over an injectable clock source (default ``time.monotonic``): only the
+highest timestamp ever observed counts, so a backward clock jump can
+never re-arm an expired confirmation. Redemption at or past the
+envelope time ``expires_at`` is expired.
 """
 
 import hmac
@@ -78,19 +81,27 @@ class ConfirmationStore:
         ) or ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be a positive number")
         self._ttl = ttl_seconds
-        self._clock = clock or time.time
+        self._clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._entries = {}
+        self._latest = float("-inf")
 
     @staticmethod
     def token_id(token):
         """Return the log-safe 8-character prefix of *token*."""
         return token[:8]
 
+    def _now_locked(self):
+        """Monotonic envelope over the injected clock (lock held)."""
+        now = self._clock()
+        if now > self._latest:
+            self._latest = now
+        return self._latest
+
     def issue(self, action, arg_hash, policy_version):
         """Issue a token bound to the given action, arg hash, and version."""
-        now = self._clock()
         with self._lock:
+            now = self._now_locked()
             token = secrets.token_urlsafe(32)
             while token in self._entries:
                 token = secrets.token_urlsafe(32)
@@ -103,8 +114,8 @@ class ConfirmationStore:
 
     def redeem(self, token, action, arg_hash, policy_version):
         """Redeem *token* or raise ConfirmationError with the reason code."""
-        now = self._clock()
         with self._lock:
+            now = self._now_locked()
             entry = self._entries.get(token)
             if entry is None:
                 raise ConfirmationError(REASON_INVALID)
@@ -129,8 +140,8 @@ class ConfirmationStore:
         stays usable. The gate calls this before policy revalidation so
         pre-execution rejections never consume a confirmation.
         """
-        now = self._clock()
         with self._lock:
+            now = self._now_locked()
             entry = self._entries.get(token)
             if entry is None:
                 raise ConfirmationError(REASON_INVALID)

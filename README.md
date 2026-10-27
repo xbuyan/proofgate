@@ -175,7 +175,8 @@ malformed arguments; unknown tools; limit and balance violations; audit
 tampering detectable by the verifier; concurrent races against limits and
 single-use tokens. Out of scope by design: arbitrary code running inside
 the same Python process (no memory isolation exists there), the host clock
-(expiry trusts it), crash recovery, and authenticated caller identity
+(audit stamps use wall time; TTL comparisons use a monotonic envelope),
+crash recovery, and authenticated caller identity
 (`actor` is a self-asserted label).
 
 ## Limitations (explicit non-claims)

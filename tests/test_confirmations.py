@@ -23,6 +23,21 @@ class FakeClock:
         self.now_value += seconds
 
 
+class FakeMonotonicClock:
+    """Faithful stand-in for time.monotonic: forward-only by force."""
+
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        if seconds < 0:
+            raise ValueError("monotonic clock cannot advance backward")
+        self.value += seconds
+
+
 class ConfirmationTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
@@ -155,6 +170,20 @@ class ConfirmationTests(unittest.TestCase):
             self.reason_of(self.store.consume, token),
             "confirmation_reused",
         )
+
+    def test_expiry_with_monotonic_clock(self):
+        clock = FakeMonotonicClock(value=0.0)
+        store = ConfirmationStore(ttl_seconds=300, clock=clock)
+        token = store.issue("transfer_money", "h", "v1")
+        clock.advance(299)
+        binding = store.check(token, "transfer_money", "h", "v1")
+        self.assertEqual(binding.policy_version, "v1")
+        clock.advance(2)
+        with self.assertRaises(ConfirmationError) as caught:
+            store.check(token, "transfer_money", "h", "v1")
+        self.assertEqual(caught.exception.reason, "confirmation_expired")
+        with self.assertRaises(ValueError):
+            clock.advance(-200)
 
 
 if __name__ == "__main__":
