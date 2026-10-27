@@ -25,16 +25,12 @@ operator reconstruction of a fresh instance.
 
 import threading
 
-from .audit import AuditError, AuditLog
+from .audit import AuditError
 from .canonical import arg_hash
-from .confirmations import (
-    ConfirmationError,
-    ConfirmationStore,
-    DEFAULT_TTL_SECONDS,
-)
-from .journal import Journal
-from .ledger import SyntheticLedger, _Mutator
+from .confirmations import ConfirmationError, ConfirmationStore
+from .ledger import _Mutator
 from .policy import Policy, evaluate, validate_policy_fields
+from .storage import MemoryBackend, StorageBackend
 from .tools import (
     get_balance as read_balance,
 )
@@ -76,8 +72,8 @@ ACTION_TRANSFER = "transfer_money"
 class Gate:
     """Deterministic enforcement gate over synthetic state."""
 
-    def __init__(self, *, policy, balances, ttl_seconds=None,
-                 clock=None, prior_export_hash=None):
+    def __init__(self, *, policy, balances=None, ttl_seconds=None,
+                 clock=None, prior_export_hash=None, storage=None):
         if not isinstance(policy, Policy):
             raise TypeError("policy must be a Policy")
         validate_policy_fields(
@@ -90,23 +86,33 @@ class Gate:
             prior_export_hash, str
         ):
             raise TypeError("prior_export_hash must be None or a string")
+        if storage is None:
+            if balances is None:
+                raise TypeError(
+                    "balances is required unless storage is supplied"
+                )
+            storage = MemoryBackend(
+                policy=policy,
+                balances=balances,
+                ttl_seconds=ttl_seconds,
+                clock=clock,
+                prior_export_hash=prior_export_hash,
+            )
+        else:
+            if balances is not None:
+                raise TypeError("pass balances or storage, not both")
+            if not isinstance(storage, StorageBackend):
+                raise TypeError("storage must be a StorageBackend")
         self._lock = threading.Lock()
+        self._storage = storage
         self._policy = policy
         self._retired_versions = set()
-        self._ledger = SyntheticLedger(balances)
+        self._ledger = storage.ledger
         self._opening = self._ledger.snapshot()
         self._mutator = _Mutator(self._ledger)
-        self._journal = Journal()
-        self._audit = AuditLog(
-            initial_policy_version=policy.version,
-            prior_export_hash=prior_export_hash,
-            clock=clock,
-        )
-        self._confirmations = ConfirmationStore(
-            ttl_seconds=DEFAULT_TTL_SECONDS
-            if ttl_seconds is None else ttl_seconds,
-            clock=clock,
-        )
+        self._journal = storage.journal
+        self._audit = storage.audit
+        self._confirmations = storage.confirmations
         self._daily_spent = 0
         self._degraded = None
 
@@ -182,7 +188,7 @@ class Gate:
 
     def gate(self, request):
         """Validate, authorize, and execute one request."""
-        with self._lock:
+        with self._lock, self._storage.transaction():
             try:
                 action, actor, args, token = validate_request(request)
             except ValidationError as exc:
@@ -387,7 +393,7 @@ class Gate:
 
     def update_policy(self, new_policy):
         """Validate, record, and activate *new_policy* atomically."""
-        with self._lock:
+        with self._lock, self._storage.transaction():
             if self._degraded is not None:
                 return {
                     "status": STATUS_ERROR,
@@ -479,7 +485,7 @@ class Gate:
         audit verification reports any problem; those states require
         reconstruction of a fresh instance instead.
         """
-        with self._lock:
+        with self._lock, self._storage.transaction():
             if self._degraded is None:
                 return {
                     "status": STATUS_ERROR,
@@ -556,7 +562,7 @@ class Gate:
         is possible until recovery; an existing incident is never
         overwritten.
         """
-        with self._lock:
+        with self._lock, self._storage.transaction():
             recon = reconcile(
                 self._opening, self._journal.entries(),
                 self._ledger.snapshot(),
@@ -639,7 +645,7 @@ class Gate:
 
 
 def create_gate(*, policy=None, balances=None, ttl_seconds=None,
-                clock=None, prior_export_hash=None):
+                clock=None, prior_export_hash=None, storage=None):
     """Create a :class:`Gate` with demo defaults unless overridden."""
     if policy is None:
         policy = Policy.create(
@@ -648,7 +654,7 @@ def create_gate(*, policy=None, balances=None, ttl_seconds=None,
             daily_cap=1000,
             allowed_targets=("bob", "carol"),
         )
-    if balances is None:
+    if balances is None and storage is None:
         balances = {"alice": 10000}
     return Gate(
         policy=policy,
@@ -656,4 +662,5 @@ def create_gate(*, policy=None, balances=None, ttl_seconds=None,
         ttl_seconds=ttl_seconds,
         clock=clock,
         prior_export_hash=prior_export_hash,
+        storage=storage,
     )

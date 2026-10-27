@@ -5,5 +5,6 @@ entry point for state-changing operations.
 """
 
 from .enforcement import Gate, create_gate
+from .storage import MemoryBackend, StorageBackend
 
-__all__ = ["Gate", "create_gate"]
+__all__ = ["Gate", "MemoryBackend", "StorageBackend", "create_gate"]
