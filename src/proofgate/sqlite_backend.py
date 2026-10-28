@@ -573,8 +573,11 @@ class SQLiteBackend(StorageBackend):
             # a pre-existing path) sees FileExistsError without the
             # winner's file being opened, modified, or deleted.
             try:
+                # Owner-only: the database holds confirmation bearer
+                # tokens. The mode is masked by, never widened
+                # beyond, the process umask.
                 fd = os.open(
-                    path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644
+                    path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
                 )
             except FileExistsError:
                 raise FileExistsError(

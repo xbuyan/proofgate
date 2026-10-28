@@ -171,6 +171,43 @@ class SchemaTests(SQLiteCase):
             self.assertEqual(handle.read(), b"junk")
         self.assertEqual(os.listdir(self.tmp.name), ["g.db"])
 
+    @unittest.skipUnless(
+        hasattr(os, "umask"), "POSIX umask required"
+    )
+    def test_create_restricts_new_file_permissions(self):
+        previous = os.umask(0o000)
+        try:
+            backend = SQLiteBackend.create(
+                self.path(), policy=make_policy(),
+                balances={"alice": 10000},
+            )
+            self._backends.append(backend)
+            mode = os.stat(self.path()).st_mode & 0o777
+        finally:
+            os.umask(previous)
+        # Owner-only even under a fully permissive umask: group
+        # and other receive no permissions on the new database.
+        self.assertEqual(mode, 0o600)
+
+    @unittest.skipUnless(
+        hasattr(os, "umask"), "POSIX umask required"
+    )
+    def test_create_existing_path_keeps_permissions(self):
+        path = self.path()
+        with open(path, "wb") as handle:
+            handle.write(b"junk")
+        os.chmod(path, 0o644)
+        original_mode = os.stat(path).st_mode & 0o777
+        with self.assertRaises(FileExistsError):
+            SQLiteBackend.create(
+                path, policy=make_policy(),
+                balances={"alice": 10000},
+            )
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"junk")
+        self.assertEqual(os.stat(path).st_mode & 0o777, original_mode)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+
     def test_create_validates_before_touching_filesystem(self):
         bad_policy = SimpleNamespace(
             version="", per_transfer_cap=1, daily_cap=1,
