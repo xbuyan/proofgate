@@ -2,7 +2,7 @@
 
 Isolated persistence only: versioned schema, WAL configuration, and an
 explicit transaction manager. NOT YET WIRED into Gate operations: this
-step adds no crash recovery, boot epochs, confirmation sweeping,
+step adds no crash recovery, confirmation sweeping,
 startup verification, operation IDs, or audit anchoring.
 
 Explicitly unsupported: multi-process serving, network filesystems, and
@@ -43,10 +43,11 @@ from .ledger import LedgerError, SyntheticLedger
 from .ledger import _Mutator as _LedgerMutator
 from .policy import Policy, validate_policy_fields
 from .storage import StorageBackend
+from .verify import VerificationError, verify_database
 
 __all__ = ["SCHEMA_VERSION", "SQLiteBackend", "SQLiteBackendError"]
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # One statement per entry (no splitting); DDL runs inside the seed
 # transaction so creation is atomic.
@@ -68,7 +69,8 @@ _SCHEMA = (
     "policy_version TEXT NOT NULL, "
     "issued_at REAL NOT NULL, "
     "expires_at REAL NOT NULL, "
-    "used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)))",
+    "used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)), "
+    "epoch INTEGER NOT NULL)",
     "CREATE TABLE ledger("
     "account TEXT PRIMARY KEY, "
     "balance INTEGER NOT NULL CHECK (balance >= 0))",
@@ -100,9 +102,30 @@ _SCHEMA = (
     "cleared_at REAL NULL)",
 )
 
+_REQUIRED_TABLES = frozenset({
+    "meta", "policy_versions", "counters", "confirmations",
+    "ledger", "journal", "audit", "incidents",
+})
+
+_V1_CONFIRMATION_COLUMNS = frozenset({
+    "token", "action", "arg_hash", "policy_version",
+    "issued_at", "expires_at", "used",
+})
+
 
 class SQLiteBackendError(Exception):
     """Backend misuse or unusable database (see message)."""
+
+
+class _CommitUncertainError(Exception):
+    """A commit (or rollback) failed; the outcome cannot be established.
+
+    Raised only by :class:`_Transaction.__exit__`. The gate translates
+    it into an ``outcome_uncertain`` result; it must never surface as
+    a denial, a success, or a claim that rollback succeeded. Imported
+    by the enforcement module under its private name (same precedent
+    as ``ledger._Mutator``).
+    """
 
 
 def _record_from_row(row):
@@ -125,6 +148,10 @@ def _record_from_row(row):
 
 def _record_hash(body):
     return hashlib.sha256(canonicalize(body)).hexdigest()
+
+
+def _targets_json(targets):
+    return canonicalize(list(targets)).decode("utf-8")
 
 
 def _checked_ttl(ttl_seconds):
@@ -371,10 +398,14 @@ class _SQLiteConfirmations:
         token = secrets.token_urlsafe(32)
         while self._fetch(token) is not None:
             token = secrets.token_urlsafe(32)
+        # Transitional value: the column is NOT NULL but epoch
+        # binding, sweeping, and enforcement arrive after S3 (which
+        # advances the counter only). Zero matches the v1 migration
+        # backfill; no current code reads this column.
         backend._conn.execute(
             "INSERT INTO confirmations(token, action, arg_hash, "
-            "policy_version, issued_at, expires_at, used) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0)",
+            "policy_version, issued_at, expires_at, used, epoch) "
+            "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
             (token, action, arg_hash, policy_version, now,
              now + backend._ttl),
         )
@@ -439,6 +470,20 @@ class _SQLiteConfirmations:
             (policy_version,),
         )
         return cursor.rowcount
+
+    def count_version(self, policy_version):
+        """Return how many stored tokens bind to *policy_version*.
+
+        Read-only counterpart to :meth:`purge_version`: same match
+        predicate, so the count equals what a subsequent purge in the
+        same undisturbed transaction would remove.
+        """
+        row = self._backend._conn.execute(
+            "SELECT COUNT(*) AS n FROM confirmations "
+            "WHERE policy_version = ?",
+            (policy_version,),
+        ).fetchone()
+        return row["n"]
 
     def clear(self):
         self._backend._require_transaction()
@@ -520,19 +565,24 @@ class SQLiteBackend(StorageBackend):
                     ("schema_version", SCHEMA_VERSION),
                 )
                 backend._conn.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?)",
+                    ("opening_balances",
+                     canonicalize(seed_balances).decode("utf-8")),
+                )
+                backend._conn.execute(
                     "INSERT INTO policy_versions(version, "
                     "per_transfer_cap, daily_cap, allowed_targets, "
                     "retired) VALUES (?, ?, ?, ?, 0)",
                     (policy.version, policy.per_transfer_cap,
                      policy.daily_cap,
-                     canonicalize(
-                         list(policy.allowed_targets)).decode("utf-8")),
+                     _targets_json(policy.allowed_targets)),
                 )
                 # Audit seqs derive from the chain (like the memory
                 # log's len+1), so only the journal needs a counter.
                 for name, value in (
                     ("daily_spent", 0),
                     ("journal_seq", 1),
+                    ("boot_epoch", 0),
                 ):
                     backend._conn.execute(
                         "INSERT INTO counters(name, value) VALUES (?, ?)",
@@ -579,23 +629,136 @@ class SQLiteBackend(StorageBackend):
             path, clock=clock, ttl_seconds=ttl_seconds
         )
         try:
-            try:
-                row = backend._conn.execute(
-                    "SELECT value FROM meta WHERE key = ?",
-                    ("schema_version",),
-                ).fetchone()
-            except sqlite3.Error as exc:
-                raise SQLiteBackendError(
-                    "not a ProofGate database: %r" % (path,)
-                ) from exc
-            if row is None or row["value"] != SCHEMA_VERSION:
-                raise SQLiteBackendError(
-                    "unsupported schema version in %r" % (path,)
-                )
+            version = cls._read_schema_version(backend, path)
+            if version == SCHEMA_VERSION:
+                cls._require_tables(backend, path)
+            elif version == "1":
+                cls._migrate_v1_to_v2(backend, path)
+            # Unknown versions fall through to the verifier, which
+            # refuses them; only v1 takes the migration path.
+            verify_database(
+                backend._conn, SCHEMA_VERSION, _REQUIRED_TABLES
+            )
+            # Verified: this open counts as one boot. Advancement is
+            # last so any failure above leaves the epoch untouched.
+            cls._advance_boot_epoch(backend)
         except BaseException:
             backend.close()
             raise
         return backend
+
+    @classmethod
+    def _read_schema_version(cls, backend, path):
+        try:
+            row = backend._conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                ("schema_version",),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise SQLiteBackendError(
+                "not a ProofGate database: %r" % (path,)
+            ) from exc
+        if row is None:
+            raise SQLiteBackendError(
+                "unsupported schema version in %r" % (path,)
+            )
+        return row["value"]
+
+    @classmethod
+    def _require_tables(cls, backend, path):
+        """Refuse a database missing any required table."""
+        tables = {
+            row[0]
+            for row in backend._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        missing = sorted(_REQUIRED_TABLES - tables)
+        if missing:
+            raise VerificationError(
+                "schema_tables",
+                "incomplete ProofGate database %r: missing tables: %s"
+                % (path, ", ".join(missing)),
+            )
+
+    @classmethod
+    def _migrate_v1_to_v2(cls, backend, path):
+        """Migrate a verified v1 database to version 2, atomically.
+
+        Read-only pre-checks first; the column add, counter seed, and
+        version flip then commit together. No audit records are
+        touched and no semantic validity is claimed (S2 owns that).
+        """
+        cls._require_tables(backend, path)
+        columns = {
+            row["name"]
+            for row in backend._conn.execute(
+                "PRAGMA table_info(confirmations)"
+            )
+        }
+        if columns != _V1_CONFIRMATION_COLUMNS:
+            raise VerificationError(
+                "schema_tables",
+                "refusing to migrate %r: confirmations table does not "
+                "match the expected version-1 schema" % (path,),
+            )
+        row = backend._conn.execute(
+            "SELECT value FROM counters WHERE name = ?",
+            ("boot_epoch",),
+        ).fetchone()
+        if row is not None:
+            raise VerificationError(
+                "counters",
+                "refusing to migrate %r: unexpected boot_epoch row "
+                "in a version-1 database" % (path,),
+            )
+        with backend.transaction():
+            backend._conn.execute(
+                "ALTER TABLE confirmations ADD COLUMN epoch "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+            backend._conn.execute(
+                "INSERT INTO counters(name, value) VALUES "
+                "('boot_epoch', 0)"
+            )
+            backend._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = ?",
+                (SCHEMA_VERSION, "schema_version"),
+            )
+
+    @classmethod
+    def _advance_boot_epoch(cls, backend):
+        """Advance boot_epoch by exactly one, with audit evidence.
+
+        Runs inside one backend transaction: the counter update and
+        the boot audit record commit together or not at all. Called
+        only from :meth:`open` after verification succeeds; callers
+        must never invoke it on an unverified database. Sweeping
+        arrives separately; this step advances and records only.
+        """
+        with backend.transaction():
+            row = backend._conn.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()
+            if row is None:
+                raise SQLiteBackendError("counter missing: 'boot_epoch'")
+            prior_epoch = row[0]
+            new_epoch = prior_epoch + 1
+            backend._conn.execute(
+                "UPDATE counters SET value = ? "
+                "WHERE name = 'boot_epoch'",
+                (new_epoch,),
+            )
+            backend.audit.append(
+                kind="boot", actor="operator", action="startup",
+                arg_hash="",
+                policy_version=backend.get_policy().version,
+                decision="recorded", reason="ok",
+                extra={
+                    "prior_epoch": prior_epoch,
+                    "new_epoch": new_epoch,
+                },
+            )
 
     @classmethod
     def _connect(cls, path, *, clock, ttl_seconds):
@@ -707,6 +870,51 @@ class SQLiteBackend(StorageBackend):
             raise SQLiteBackendError("counter missing: 'daily_spent'")
         return row["value"]
 
+    def activate_policy(self, new_policy):
+        """Retire the active version and activate *new_policy*."""
+        self._require_transaction()
+        self._conn.execute(
+            "UPDATE policy_versions SET retired = 1 WHERE retired = 0"
+        )
+        self._conn.execute(
+            "INSERT INTO policy_versions(version, per_transfer_cap, "
+            "daily_cap, allowed_targets, retired) "
+            "VALUES (?, ?, ?, ?, 0)",
+            (new_policy.version, new_policy.per_transfer_cap,
+             new_policy.daily_cap,
+             _targets_json(new_policy.allowed_targets)),
+        )
+
+    def add_daily_spent(self, amount):
+        """Add *amount* to the persisted spend counter."""
+        self._require_transaction()
+        self._conn.execute(
+            "UPDATE counters SET value = value + ? "
+            "WHERE name = 'daily_spent'",
+            (amount,),
+        )
+
+    def reset_daily_spent(self):
+        """Reset the persisted spend counter to zero."""
+        self._require_transaction()
+        self._conn.execute(
+            "UPDATE counters SET value = 0 WHERE name = 'daily_spent'"
+        )
+
+    def get_opening_balances(self):
+        """Return the construction balances for reconciliation."""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("opening_balances",),
+        ).fetchone()
+        if row is None:
+            raise SQLiteBackendError("opening balances missing")
+        return json.loads(row["value"])
+
+    def mutator(self):
+        """Return the gate-held mutation capability for our ledger."""
+        return _Mutator(self.ledger)
+
 
 class _Transaction:
     """Explicit BEGIN IMMEDIATE / COMMIT / ROLLBACK unit."""
@@ -720,8 +928,10 @@ class _Transaction:
             raise SQLiteBackendError(
                 "nested transactions are not supported"
             )
-        backend._in_transaction = True
+        # Flag set only after BEGIN succeeds: a failed BEGIN must not
+        # wedge the backend into a phantom transaction.
         backend._conn.execute("BEGIN IMMEDIATE")
+        backend._in_transaction = True
         return backend
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -730,11 +940,29 @@ class _Transaction:
             if exc_type is None:
                 try:
                     backend._conn.commit()
-                except BaseException:
-                    backend._conn.rollback()
-                    raise
+                except Exception as exc:
+                    # BaseExceptions (KeyboardInterrupt/SystemExit)
+                    # propagate untouched per F2; the owner treats a
+                    # mid-commit interrupt as suspect state.
+                    try:
+                        backend._conn.rollback()
+                    except Exception as rollback_exc:
+                        raise _CommitUncertainError(
+                            "commit failed (%s) and rollback failed "
+                            "(%s); outcome uncertain"
+                            % (exc, rollback_exc)
+                        ) from exc
+                    raise _CommitUncertainError(
+                        "commit failed (%s); outcome uncertain" % (exc,)
+                    ) from exc
             else:
-                backend._conn.rollback()
+                try:
+                    backend._conn.rollback()
+                except Exception as exc:
+                    raise _CommitUncertainError(
+                        "rollback failed (%s); outcome uncertain"
+                        % (exc,)
+                    ) from exc
         finally:
             backend._in_transaction = False
         return False

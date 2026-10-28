@@ -85,16 +85,16 @@ identical parties, a confirmation on a read-only call — are denied with
 `update_policy()` runs under the same lock: it re-validates all fields
 (direct dataclass construction bypasses `Policy.create`, so validation is
 repeated here), rejects the current version and any previously used version
-(a retired-version set blocks rollback revival), purges old-version tokens,
-appends the `policy_updated` record, then activates the new policy and
-resets the spent counter to start a new epoch.
+(a retired-version set blocks rollback revival), counts old-version tokens,
+appends the `policy_updated` record, then purges, activates the new policy,
+and resets the spent counter to start a new epoch.
 
-Purge ordering note: the purge runs before the `policy_updated` append so
-the purged count is recorded in the event. If that append fails, the old
-policy is retained but its tokens are already gone — a fail-closed outcome
-whose only observable trace is a lowered `pending_confirmations` count in
-`status()` until `operator_reset` clears the store. A failed update never
-activates silently: the gate enters degraded mode instead.
+Purge ordering note: the gate counts old-version tokens first so the
+purged count is recorded in the event, but the purge itself runs only
+after the `policy_updated` append succeeds, followed by activation and
+the spent-counter reset. If the append fails, nothing changes — the old
+policy stays active with its tokens intact — and the gate enters
+degraded mode instead of activating silently.
 
 ## Audit, journal, ledger, reconciliation
 

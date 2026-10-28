@@ -15,9 +15,26 @@ journal object — not independent durable verification.
 :func:`cross_check_journal_audit` verifies that every journal entry has
 a matching successful OUTCOME audit record; entries without one are
 reported as gaps (the residue of an unrecorded outcome).
+
+Startup verification (:func:`verify_database`) runs the same read-only
+checks plus schema, metadata, policy, counter, ledger, confirmation,
+journal, and audit validation before a persisted backend may serve.
+It never writes.
 """
 
-__all__ = ["cross_check_journal_audit", "reconcile"]
+import json
+import math
+
+from .audit import GENESIS_PREV_HASH, _verify_chain
+from .journal import JournalEntry
+from .policy import validate_policy_fields
+
+__all__ = [
+    "VerificationError",
+    "cross_check_journal_audit",
+    "reconcile",
+    "verify_database",
+]
 
 
 def _replay(opening_balances, entries):
@@ -94,3 +111,353 @@ def cross_check_journal_audit(journal_entries, audit_records):
         "malformed_outcomes": problems,
         "checked_entries": len(journal_seqs),
     }
+
+
+class VerificationError(Exception):
+    """Startup verification refused the database.
+
+    ``category`` names the failed check group; ``detail`` carries
+    structural facts only (names, counts, sequence numbers — never
+    token values or other secrets). This is deliberately not a
+    ``SQLiteBackendError`` subclass: ``verify`` must not import the
+    backend module (circular), so callers distinguish refusals by
+    catching this type directly.
+    """
+
+    def __init__(self, category, detail=None):
+        super().__init__(
+            "verification failed [%s]: %s" % (category, detail)
+        )
+        self.category = category
+        self.detail = detail if detail is not None else {}
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _audit_record_from_row(row):
+    """Rebuild an audit record dict from a storage row (positional).
+
+    Column order must match the SELECT in :func:`verify_database`.
+    Must agree field-for-field with
+    ``sqlite_backend._record_from_row``; any drift breaks
+    valid-database opens, so the S2 suite pins it.
+    """
+    return {
+        "kind": row[0],
+        "seq": row[1],
+        "ts": row[2],
+        "actor": row[3],
+        "action": row[4],
+        "arg_hash": row[5],
+        "policy_version": row[6],
+        "decision": row[7],
+        "reason": row[8],
+        "token_id": row[9],
+        "extra": json.loads(row[10]),
+        "prev_hash": row[11],
+        "record_hash": row[12],
+    }
+
+
+def verify_database(conn, expected_version, required_tables):
+    """Verify a ProofGate database for startup. Read-only.
+
+    Checks, in order: SQLite integrity (``PRAGMA quick_check``),
+    schema version, required tables, metadata, policy, counters,
+    ledger, confirmations, journal continuity, the full audit chain,
+    and ledger/journal/audit reconciliation. Only ``SELECT`` and
+    ``PRAGMA`` statements run; no application state is written.
+
+    Raises :class:`VerificationError` naming the failed category.
+    Returns a summary dict on success. Positional row access only, so
+    any row factory works.
+    """
+    summary = {}
+    stage = "startup"
+    try:
+        stage = "sqlite_integrity"
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+        if [tuple(row) for row in rows] != [("ok",)]:
+            raise VerificationError(
+                stage,
+                {"problems": [tuple(row) for row in rows][:5]},
+            )
+
+        stage = "schema_version"
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        version = row[0] if row is not None else None
+        if version != expected_version:
+            raise VerificationError(stage, {"found": version})
+        summary["schema_version"] = version
+
+        stage = "schema_tables"
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        missing = sorted(set(required_tables) - tables)
+        if missing:
+            raise VerificationError(
+                stage, "missing tables: %s" % ", ".join(missing)
+            )
+        summary["tables"] = len(tables)
+
+        stage = "metadata"
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'opening_balances'"
+        ).fetchone()
+        if row is None:
+            raise VerificationError(
+                stage, {"missing": "opening_balances"}
+            )
+        try:
+            opening = json.loads(row[0])
+        except ValueError as exc:
+            raise VerificationError(
+                stage,
+                {"key": "opening_balances", "problem": "unparseable"},
+            ) from exc
+        if not isinstance(opening, dict) or any(
+            not isinstance(account, str)
+            or not account
+            or not _is_int(balance)
+            or balance < 0
+            for account, balance in opening.items()
+        ):
+            raise VerificationError(
+                stage,
+                {"key": "opening_balances", "problem": "bad_shape"},
+            )
+        summary["opening_accounts"] = len(opening)
+
+        stage = "counters"
+        counters = {}
+        for name in ("daily_spent", "journal_seq", "boot_epoch"):
+            row = conn.execute(
+                "SELECT value FROM counters WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None:
+                raise VerificationError(stage, {"missing": name})
+            if not _is_int(row[0]) or row[0] < 0:
+                raise VerificationError(
+                    stage, {"counter": name, "problem": "bad_value"}
+                )
+            counters[name] = row[0]
+        if counters["journal_seq"] < 1:
+            raise VerificationError(
+                stage,
+                {"counter": "journal_seq", "problem": "below_one"},
+            )
+        summary["daily_spent"] = counters["daily_spent"]
+        summary["boot_epoch"] = counters["boot_epoch"]
+
+        stage = "policy"
+        rows = conn.execute(
+            "SELECT version, per_transfer_cap, daily_cap, "
+            "allowed_targets, retired FROM policy_versions"
+        ).fetchall()
+        active = [row for row in rows if row[4] == 0]
+        if len(active) != 1:
+            raise VerificationError(
+                stage,
+                {
+                    "problem": "not_exactly_one_active",
+                    "active_count": len(active),
+                },
+            )
+        for row in rows:
+            if row[4] not in (0, 1):
+                raise VerificationError(
+                    stage,
+                    {"version": row[0], "problem": "bad_retired"},
+                )
+            try:
+                targets = json.loads(row[3])
+            except ValueError as exc:
+                raise VerificationError(
+                    stage,
+                    {"version": row[0], "problem": "bad_targets"},
+                ) from exc
+            if not isinstance(targets, list):
+                raise VerificationError(
+                    stage,
+                    {"version": row[0], "problem": "bad_targets"},
+                )
+            try:
+                validate_policy_fields(
+                    version=row[0],
+                    per_transfer_cap=row[1],
+                    daily_cap=row[2],
+                    allowed_targets=targets,
+                )
+            except ValueError as exc:
+                raise VerificationError(
+                    stage,
+                    {"version": row[0], "problem": "invalid"},
+                ) from exc
+        summary["policy_version"] = active[0][0]
+        summary["retired_versions"] = len(rows) - 1
+
+        stage = "ledger"
+        balances = {}
+        for row in conn.execute("SELECT account, balance FROM ledger"):
+            account, balance = row[0], row[1]
+            if (
+                not isinstance(account, str)
+                or not account
+                or not _is_int(balance)
+                or balance < 0
+            ):
+                raise VerificationError(
+                    stage,
+                    {
+                        "problem": "bad_row",
+                        "account": str(account)[:32],
+                    },
+                )
+            balances[account] = balance
+        summary["ledger_accounts"] = len(balances)
+
+        stage = "confirmations"
+        confirm_rows = conn.execute(
+            "SELECT token, action, arg_hash, policy_version, "
+            "issued_at, expires_at, used, epoch FROM confirmations"
+        ).fetchall()
+        for index, row in enumerate(confirm_rows):
+            token, action, arg_hash, version = (
+                row[0], row[1], row[2], row[3]
+            )
+            issued, expires, used, epoch = (
+                row[4], row[5], row[6], row[7]
+            )
+            if (
+                not isinstance(token, str) or not token
+                or not isinstance(action, str) or not action
+                or not isinstance(arg_hash, str) or not arg_hash
+                or not isinstance(version, str) or not version
+            ):
+                raise VerificationError(
+                    stage, {"index": index, "problem": "bad_binding"}
+                )
+            if used not in (0, 1):
+                raise VerificationError(
+                    stage, {"index": index, "problem": "bad_used"}
+                )
+            if not _is_int(epoch) or epoch < 0:
+                raise VerificationError(
+                    stage, {"index": index, "problem": "bad_epoch"}
+                )
+            if (
+                not _is_number(issued)
+                or not _is_number(expires)
+                or not math.isfinite(issued)
+                or not math.isfinite(expires)
+                or expires < issued
+            ):
+                raise VerificationError(
+                    stage, {"index": index, "problem": "bad_expiry"}
+                )
+        summary["confirmations"] = len(confirm_rows)
+
+        stage = "journal"
+        entries = []
+        for row in conn.execute(
+            "SELECT seq, action, source, target, amount FROM journal "
+            "ORDER BY seq"
+        ):
+            seq, action, source, target, amount = (
+                row[0], row[1], row[2], row[3], row[4]
+            )
+            if (
+                not _is_int(seq)
+                or not isinstance(source, str) or not source
+                or not isinstance(target, str) or not target
+                or not _is_int(amount) or amount <= 0
+            ):
+                raise VerificationError(
+                    stage, {"seq": seq, "problem": "bad_row"}
+                )
+            entries.append(
+                JournalEntry(seq, action, source, target, amount)
+            )
+        seqs = [entry.seq for entry in entries]
+        if seqs != list(range(1, len(seqs) + 1)):
+            raise VerificationError(
+                stage,
+                {"problem": "sequence_gap", "count": len(seqs)},
+            )
+        if (seqs[-1] if seqs else 0) != counters["journal_seq"] - 1:
+            raise VerificationError(
+                stage, {"problem": "counter_drift"}
+            )
+        summary["journal_entries"] = len(entries)
+
+        stage = "audit"
+        rows = conn.execute(
+            "SELECT kind, seq, ts, actor, action, arg_hash, "
+            "policy_version, decision, reason, token_id, extra_json, "
+            "prev_hash, record_hash FROM audit ORDER BY seq"
+        ).fetchall()
+        if not rows:
+            raise VerificationError(stage, {"problem": "empty_chain"})
+        seqs = [row[1] for row in rows]
+        if seqs != list(range(1, len(rows) + 1)):
+            raise VerificationError(
+                stage, {"problem": "sequence_gap", "count": len(rows)}
+            )
+        if rows[0][0] != "genesis" or rows[0][11] != GENESIS_PREV_HASH:
+            raise VerificationError(stage, {"problem": "bad_genesis"})
+        try:
+            records = [_audit_record_from_row(row) for row in rows]
+        except (ValueError, TypeError) as exc:
+            raise VerificationError(
+                stage, {"problem": "unparseable_extra"}
+            ) from exc
+        ok, detail = _verify_chain(records)
+        if not ok:
+            raise VerificationError(stage, detail)
+        summary["audit_records"] = len(records)
+
+        stage = "reconcile"
+        report = reconcile(opening, entries, balances)
+        if not report["clean"]:
+            raise VerificationError(
+                stage,
+                {
+                    "mismatched_accounts": sorted(
+                        report["mismatches"]
+                    )[:8],
+                    "journal_ahead": report["journal_ahead"],
+                },
+            )
+
+        stage = "cross_check"
+        cross = cross_check_journal_audit(entries, records)
+        if not cross["clean"]:
+            raise VerificationError(
+                stage,
+                {
+                    "gaps": cross["gaps"][:8],
+                    "orphans": sorted(cross["orphans"])[:8],
+                    "malformed_outcomes": cross[
+                        "malformed_outcomes"
+                    ][:8],
+                },
+            )
+    except VerificationError:
+        raise
+    except Exception as exc:
+        raise VerificationError(
+            stage, {"problem": "unreadable", "error": type(exc).__name__}
+        ) from exc
+    return summary

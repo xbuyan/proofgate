@@ -187,6 +187,20 @@ class ConfirmationStore:
                 del self._entries[token]
             return len(doomed)
 
+    def count_version(self, policy_version):
+        """Return how many stored tokens bind to *policy_version*.
+
+        Read-only: same predicate as :meth:`purge_version`, so the
+        count always equals what a subsequent purge would remove while
+        the store is undisturbed.
+        """
+        with self._lock:
+            return sum(
+                1
+                for entry in self._entries.values()
+                if entry.binding.policy_version == policy_version
+            )
+
     def clear(self):
         """Drop all tokens; return the count removed."""
         with self._lock:

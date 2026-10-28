@@ -145,6 +145,17 @@ class ConfirmationTests(unittest.TestCase):
         )
         self.redeem(other, "transfer_money", "h", "v2")  # v2 token survives
 
+    def test_count_version_matches_purge(self):
+        self.issue(version="v1")
+        self.issue(version="v1")
+        self.issue(version="v2")
+        self.assertEqual(self.store.count_version("v1"), 2)
+        self.assertEqual(self.store.count_version("v2"), 1)
+        self.assertEqual(self.store.count_version("v9"), 0)
+        # Read-only: purge still removes exactly the counted tokens.
+        self.assertEqual(self.store.purge_version("v1"), 2)
+        self.assertEqual(self.store.count_version("v1"), 0)
+
     def test_clear(self):
         self.issue()
         self.issue()

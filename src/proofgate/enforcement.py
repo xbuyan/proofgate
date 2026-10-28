@@ -23,13 +23,15 @@ journal/audit cross-check, and audit verification are all clean) or
 operator reconstruction of a fresh instance.
 """
 
+import functools
+import sqlite3
 import threading
 
 from .audit import AuditError
 from .canonical import arg_hash
 from .confirmations import ConfirmationError, ConfirmationStore
-from .ledger import _Mutator
 from .policy import Policy, evaluate, validate_policy_fields
+from .sqlite_backend import SQLiteBackendError, _CommitUncertainError
 from .storage import MemoryBackend, StorageBackend
 from .tools import (
     get_balance as read_balance,
@@ -64,9 +66,53 @@ REASON_INVALID_POLICY = "invalid_policy"
 REASON_VERSION_REUSED = "version_reused"
 REASON_VERSION_UNCHANGED = "version_unchanged"
 REASON_TOKEN_COMMIT_FAILED = "token_commit_failed"
+REASON_STORAGE_UNAVAILABLE = "storage_unavailable"
+REASON_OUTCOME_UNCERTAIN = "outcome_uncertain"
 
 ACTION_BALANCE = "get_balance"
 ACTION_TRANSFER = "transfer_money"
+
+
+def _with_storage_boundary(method):
+    """Translate backend storage faults into structured gate results.
+
+    Applied to the transacted gate operations. The wrapped method runs
+    its storage transaction normally; if a storage-layer failure
+    escapes (the backend already rolled back) or the commit outcome is
+    uncertain, the gate is marked degraded and a structured ``error``
+    result is returned instead of leaking a raw driver exception. No
+    audit evidence is fabricated for the rolled-back attempt, and no
+    transfer is claimed to have executed.
+
+    Only storage faults are translated. Programmer errors (including
+    backend-misuse errors), fault-hook behavior, and control-flow
+    exceptions such as KeyboardInterrupt propagate untouched.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except _CommitUncertainError as exc:
+            reason = REASON_OUTCOME_UNCERTAIN
+            case = "outcome_uncertain"
+            detail = "%s: %s" % (method.__name__, exc)
+        except sqlite3.Error as exc:
+            reason = REASON_STORAGE_UNAVAILABLE
+            case = "storage_unavailable"
+            detail = "%s: rolled back: %s" % (method.__name__, exc)
+        with self._lock:
+            try:
+                self._set_degraded(case, detail)
+            except sqlite3.Error:
+                # The store is unusable even for reads; keep a minimal
+                # incident rather than losing the failure entirely.
+                self._degraded = {
+                    "case": case,
+                    "detail": detail,
+                    "audit_records": "unknown",
+                }
+        return {"status": STATUS_ERROR, "reason": reason}
+    return wrapper
 
 
 class Gate:
@@ -105,15 +151,20 @@ class Gate:
                 raise TypeError("storage must be a StorageBackend")
         self._lock = threading.Lock()
         self._storage = storage
-        self._policy = policy
-        self._retired_versions = set()
+        # Policy, retired versions, and counters are backend-owned;
+        # the gate keeps no mirrors. A supplied policy must agree with
+        # the backend's active policy; disagreement is a construction
+        # bug, not something to resolve silently.
+        if storage.get_policy() != policy:
+            raise ValueError(
+                "storage active policy does not match supplied policy"
+            )
         self._ledger = storage.ledger
-        self._opening = self._ledger.snapshot()
-        self._mutator = _Mutator(self._ledger)
+        self._opening = storage.get_opening_balances()
+        self._mutator = storage.mutator()
         self._journal = storage.journal
         self._audit = storage.audit
         self._confirmations = storage.confirmations
-        self._daily_spent = 0
         self._degraded = None
 
     # ------------------------------------------------------------------
@@ -123,7 +174,7 @@ class Gate:
     def _live_state(self):
         return {
             "balances": self._ledger.snapshot(),
-            "daily_spent": self._daily_spent,
+            "daily_spent": self._storage.get_daily_spent(),
         }
 
     def _set_degraded(self, case, detail, **extra):
@@ -142,7 +193,8 @@ class Gate:
         try:
             self._record(
                 kind="decision", actor=actor, action=action,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_DENIED, reason=reason,
             )
         except AuditError:
@@ -160,7 +212,8 @@ class Gate:
         try:
             self._record(
                 kind="decision", actor=actor, action=action,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_ERROR, reason=REASON_DEGRADED,
             )
         except AuditError:
@@ -172,7 +225,8 @@ class Gate:
         try:
             self._record(
                 kind="outcome", actor=actor, action=ACTION_TRANSFER,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=decision, reason=reason, token_id=token_id,
                 extra={"journal_seq": journal_seq},
             )
@@ -186,6 +240,7 @@ class Gate:
     # gate entry point
     # ------------------------------------------------------------------
 
+    @_with_storage_boundary
     def gate(self, request):
         """Validate, authorize, and execute one request."""
         with self._lock, self._storage.transaction():
@@ -207,7 +262,8 @@ class Gate:
 
     def _read_balance(self, actor, args, digest):
         permitted, reason = evaluate(
-            self._policy, ACTION_BALANCE, args, self._live_state()
+            self._storage.get_policy(), ACTION_BALANCE, args,
+            self._live_state()
         )
         if not permitted:
             return self._deny(
@@ -218,7 +274,8 @@ class Gate:
         try:
             self._record(
                 kind="decision", actor=actor, action=ACTION_BALANCE,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_ALLOWED, reason=REASON_OK,
             )
         except AuditError:
@@ -239,7 +296,8 @@ class Gate:
 
     def _transfer_initial(self, actor, args, digest):
         permitted, reason = evaluate(
-            self._policy, ACTION_TRANSFER, args, self._live_state()
+            self._storage.get_policy(), ACTION_TRANSFER, args,
+            self._live_state()
         )
         if not permitted:
             return self._deny(
@@ -247,12 +305,14 @@ class Gate:
                 actor=actor,
             )
         token = self._confirmations.issue(
-            ACTION_TRANSFER, digest, self._policy.version
+            ACTION_TRANSFER, digest,
+            self._storage.get_policy().version,
         )
         try:
             self._record(
                 kind="decision", actor=actor, action=ACTION_TRANSFER,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_CONFIRMATION_REQUIRED, reason=REASON_OK,
                 token_id=ConfirmationStore.token_id(token),
             )
@@ -275,7 +335,8 @@ class Gate:
     def _transfer_redeem(self, actor, args, digest, token):
         try:
             self._confirmations.check(
-                token, ACTION_TRANSFER, digest, self._policy.version
+                token, ACTION_TRANSFER, digest,
+                self._storage.get_policy().version,
             )
         except ConfirmationError as exc:
             return self._deny(
@@ -283,7 +344,8 @@ class Gate:
                 actor=actor,
             )
         permitted, reason = evaluate(
-            self._policy, ACTION_TRANSFER, args, self._live_state()
+            self._storage.get_policy(), ACTION_TRANSFER, args,
+            self._live_state()
         )
         if not permitted:
             return self._deny(
@@ -294,7 +356,8 @@ class Gate:
         try:
             self._record(
                 kind="authorized", actor=actor, action=ACTION_TRANSFER,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision="authorized", reason=REASON_OK,
                 token_id=token_id,
             )
@@ -330,6 +393,11 @@ class Gate:
                 args["amount"],
             )
         except Exception as exc:
+            if isinstance(exc, (sqlite3.Error, SQLiteBackendError)):
+                # Storage faults are not ledger logic faults: let the
+                # transaction roll back and the storage boundary report
+                # them. Fault-hook RuntimeErrors still land below.
+                raise
             self._set_degraded(
                 "journal_ledger_divergence",
                 "journal seq %d appended; ledger apply failed: %s"
@@ -344,11 +412,12 @@ class Gate:
                 "status": STATUS_ERROR,
                 "reason": REASON_EXECUTION_FAILED,
             }
-        self._daily_spent += args["amount"]
+        self._storage.add_daily_spent(args["amount"])
         try:
             self._record(
                 kind="outcome", actor=actor, action=ACTION_TRANSFER,
-                arg_hash=digest, policy_version=self._policy.version,
+                arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_ALLOWED, reason=REASON_OK,
                 token_id=token_id,
                 extra={
@@ -383,7 +452,7 @@ class Gate:
                 "journal_seq": entry.seq,
                 "source_balance": new_source,
                 "target_balance": new_target,
-                "policy_version": self._policy.version,
+                "policy_version": self._storage.get_policy().version,
             },
         }
 
@@ -391,6 +460,7 @@ class Gate:
     # operator methods
     # ------------------------------------------------------------------
 
+    @_with_storage_boundary
     def update_policy(self, new_policy):
         """Validate, record, and activate *new_policy* atomically."""
         with self._lock, self._storage.transaction():
@@ -412,16 +482,21 @@ class Gate:
                 return self._reject_policy_update(
                     new_policy, REASON_INVALID_POLICY
                 )
-            if new_policy.version == self._policy.version:
+            if new_policy.version == self._storage.get_policy().version:
                 return self._reject_policy_update(
                     new_policy, REASON_VERSION_UNCHANGED
                 )
-            if new_policy.version in self._retired_versions:
+            if new_policy.version in self._storage.retired_versions():
                 return self._reject_policy_update(
                     new_policy, REASON_VERSION_REUSED
                 )
-            old_version = self._policy.version
-            purged = self._confirmations.purge_version(old_version)
+            old_version = self._storage.get_policy().version
+            # Count first, mutate later: the audit record must carry
+            # the invalidation count, but no state may change before
+            # the record succeeds. Under the gate lock (and the SQLite
+            # transaction) nothing can interleave, so the later purge
+            # removes exactly the counted tokens.
+            purged = self._confirmations.count_version(old_version)
             try:
                 self._record(
                     kind="policy_updated", actor="operator",
@@ -443,9 +518,9 @@ class Gate:
                     "status": STATUS_ERROR,
                     "reason": REASON_AUDIT_UNAVAILABLE,
                 }
-            self._retired_versions.add(old_version)
-            self._policy = new_policy
-            self._daily_spent = 0
+            self._confirmations.purge_version(old_version)
+            self._storage.activate_policy(new_policy)
+            self._storage.reset_daily_spent()
             return {
                 "status": STATUS_POLICY_UPDATED,
                 "reason": REASON_OK,
@@ -459,7 +534,7 @@ class Gate:
             self._record(
                 kind="policy_update_rejected", actor="operator",
                 action="update_policy", arg_hash="",
-                policy_version=self._policy.version,
+                policy_version=self._storage.get_policy().version,
                 decision=STATUS_DENIED, reason=reason,
                 extra={
                     "proposed_version": getattr(
@@ -478,6 +553,7 @@ class Gate:
             }
         return {"status": STATUS_DENIED, "reason": reason}
 
+    @_with_storage_boundary
     def operator_reset(self):
         """Clear degraded mode after verifying a clean state.
 
@@ -521,7 +597,7 @@ class Gate:
                 self._record(
                     kind="degraded_cleared", actor="operator",
                     action="operator_reset", arg_hash="",
-                    policy_version=self._policy.version,
+                    policy_version=self._storage.get_policy().version,
                     decision="recorded", reason=REASON_OK,
                     extra={"incident": self._degraded["case"]},
                 )
@@ -545,14 +621,15 @@ class Gate:
                 "degraded": self._degraded is not None,
                 "incident": dict(self._degraded)
                 if self._degraded is not None else None,
-                "policy_version": self._policy.version,
-                "daily_spent": self._daily_spent,
+                "policy_version": self._storage.get_policy().version,
+                "daily_spent": self._storage.get_daily_spent(),
                 "audit_records": len(self._audit),
                 "journal_entries": len(self._journal),
                 "pending_confirmations":
                     self._confirmations.pending_count(),
             }
 
+    @_with_storage_boundary
     def check_health(self):
         """Reconcile, cross-check, and verify; report the findings.
 
@@ -601,7 +678,7 @@ class Gate:
                 self._record(
                     kind="verification", actor="operator",
                     action="reconcile", arg_hash="",
-                    policy_version=self._policy.version,
+                    policy_version=self._storage.get_policy().version,
                     decision="mismatch", reason=reason,
                     extra={"report": "see operator log"},
                 )
@@ -641,7 +718,7 @@ class Gate:
     def current_policy(self):
         """Return the active (frozen) policy."""
         with self._lock:
-            return self._policy
+            return self._storage.get_policy()
 
 
 def create_gate(*, policy=None, balances=None, ttl_seconds=None,

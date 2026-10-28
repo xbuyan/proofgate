@@ -35,6 +35,7 @@ from proofgate.sqlite_backend import (
 from proofgate.sqlite_backend import _Mutator as SQLiteMutator
 from proofgate.storage import MemoryBackend, StorageBackend
 from proofgate.tools import transfer_money
+from proofgate.verify import VerificationError
 
 
 class FakeClock:
@@ -124,7 +125,7 @@ class SchemaTests(SQLiteCase):
                 "ledger", "journal", "audit", "incidents",
             },
         )
-        self.assertEqual(SCHEMA_VERSION, "1")
+        self.assertEqual(SCHEMA_VERSION, "2")
         self.assertEqual(backend.get_policy(), make_policy())
         self.assertEqual(backend.retired_versions(), frozenset())
         self.assertEqual(backend.get_daily_spent(), 0)
@@ -309,7 +310,7 @@ class OpenTests(SQLiteCase):
             raw.commit()
         finally:
             raw.close()
-        with self.assertRaises(SQLiteBackendError):
+        with self.assertRaises(VerificationError):
             SQLiteBackend.open(self.path())
 
     def test_open_memory_is_fresh(self):
@@ -333,6 +334,19 @@ class OpenTests(SQLiteCase):
             SQLiteMutator(backend.ledger).apply_transfer(
                 "alice", "bob", 100
             )
+            SQLiteMutator(backend.ledger).apply_transfer(
+                "alice", "carol", 50
+            )
+            # Gate-consistent evidence: every journal entry needs its
+            # successful OUTCOME record for startup verification.
+            for seq in (1, 2):
+                backend.audit.append(
+                    kind="outcome", actor="agent",
+                    action="transfer_money", arg_hash="h",
+                    policy_version="v1", decision="allowed",
+                    reason="ok", token_id="deadbeef",
+                    extra={"journal_seq": seq},
+                )
         self.assertEqual((first.seq, second.seq), (1, 2))
         backend = self.reopen(backend, clock=FakeClock(1000.0))
         entries = backend.journal.entries()
@@ -343,8 +357,18 @@ class OpenTests(SQLiteCase):
              (2, "transfer_money", "alice", "carol", 50)],
         )
         records = backend.audit.records
-        self.assertEqual(len(records), 2)
+        # The reopen is one boot: S3 appends boot evidence without
+        # rewriting the pre-existing chain.
+        self.assertEqual(len(records), 5)
         self.assertEqual(records[1], record)
+        boot = records[4]
+        self.assertEqual(boot["kind"], "boot")
+        self.assertEqual(boot["action"], "startup")
+        self.assertEqual(
+            (boot["extra"]["prior_epoch"],
+             boot["extra"]["new_epoch"]),
+            (0, 1),
+        )
         binding = backend.confirmations.check(
             token, "transfer_money", "h", "v1"
         )
@@ -352,11 +376,316 @@ class OpenTests(SQLiteCase):
             binding, Binding("transfer_money", "h", "v1")
         )
         self.assertEqual(
-            backend.ledger.snapshot(), {"alice": 9900, "bob": 100}
+            backend.ledger.snapshot(),
+            {"alice": 9850, "bob": 100, "carol": 50},
         )
         self.assertEqual(backend.get_policy(), make_policy())
         ok, _ = backend.audit.verify()
         self.assertTrue(ok)
+
+
+class SchemaVersionTests(SQLiteCase):
+    def make_v1_database(self, name="g.db"):
+        """Build a true v1 database by downgrading a fresh create."""
+        backend = self.create(name=name)
+        with backend.transaction():
+            SQLiteMutator(backend.ledger).apply_transfer(
+                "alice", "bob", 100
+            )
+            backend.journal.append_transfer("alice", "bob", 100)
+            backend.audit.append(
+                kind="outcome", actor="agent", action="transfer_money",
+                arg_hash="h", policy_version="v1",
+                decision="allowed", reason="ok", token_id="deadbeef",
+                extra={"journal_seq": 1},
+            )
+            token = backend.confirmations.issue(
+                "transfer_money", "h", "v1"
+            )
+        backend.close()
+        raw = sqlite3.connect(self.path(name))
+        try:
+            raw.execute(
+                "ALTER TABLE confirmations DROP COLUMN epoch"
+            )
+            raw.execute(
+                "DELETE FROM counters WHERE name = 'boot_epoch'"
+            )
+            raw.execute(
+                "UPDATE meta SET value = '1' "
+                "WHERE key = 'schema_version'"
+            )
+            raw.commit()
+            columns = {
+                row[1]
+                for row in raw.execute(
+                    "PRAGMA table_info(confirmations)"
+                )
+            }
+        finally:
+            raw.close()
+        # Pin the fixture to the historical v1 contract.
+        self.assertEqual(
+            columns,
+            {"token", "action", "arg_hash", "policy_version",
+             "issued_at", "expires_at", "used"},
+        )
+        return token
+
+    def test_create_seeds_version_2_and_boot_epoch(self):
+        backend = self.create()
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            epoch = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in raw.execute(
+                    "PRAGMA table_info(confirmations)"
+                )
+            }
+        finally:
+            raw.close()
+        self.assertEqual(version, "2")
+        self.assertEqual(version, SCHEMA_VERSION)
+        self.assertEqual(epoch, 0)
+        self.assertIn("epoch", columns)
+        with backend.transaction():
+            token = backend.confirmations.issue(
+                "transfer_money", "h", "v1"
+            )
+        raw = sqlite3.connect(self.path())
+        try:
+            row = raw.execute(
+                "SELECT epoch, used FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()
+        finally:
+            raw.close()
+        self.assertEqual(tuple(row), (0, 0))
+
+    def test_migrate_v1_to_v2(self):
+        token = self.make_v1_database()
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            epoch = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()[0]
+            token_epoch = raw.execute(
+                "SELECT epoch FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()[0]
+            balance = raw.execute(
+                "SELECT balance FROM ledger WHERE account = 'alice'"
+            ).fetchone()[0]
+            journal_rows = raw.execute(
+                "SELECT COUNT(*) FROM journal"
+            ).fetchone()[0]
+            audit_rows = raw.execute(
+                "SELECT COUNT(*) FROM audit"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(version, "2")
+        # The opening migration is followed by one boot (S3): the
+        # epoch advances 0 -> 1 with its audit evidence.
+        self.assertEqual(epoch, 1)
+        self.assertEqual(token_epoch, 0)
+        self.assertEqual(balance, 9900)
+        self.assertEqual(journal_rows, 1)
+        self.assertEqual(audit_rows, 3)
+        self.assertEqual(backend.get_policy(), make_policy())
+        # Migrated store is fully functional.
+        with backend.transaction():
+            fresh = backend.confirmations.issue(
+                "transfer_money", "h2", "v1"
+            )
+        binding = backend.confirmations.check(
+            fresh, "transfer_money", "h2", "v1"
+        )
+        self.assertEqual(binding.policy_version, "v1")
+        # Transitional semantic: pre-existing tokens are NOT yet
+        # invalidated (epoch enforcement and sweeping arrive after
+        # S3, which advances the counter only).
+        old = backend.confirmations.check(
+            token, "transfer_money", "h", "v1"
+        )
+        self.assertEqual(old.action, "transfer_money")
+
+    def test_migrate_v1_rollback(self):
+        self.make_v1_database()
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute(
+                "CREATE TRIGGER t_abort_meta BEFORE UPDATE ON meta "
+                "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        # RAISE(ABORT, ...) reports SQLITE_CONSTRAINT, which Python
+        # maps to IntegrityError (not OperationalError).
+        with self.assertRaises(sqlite3.IntegrityError):
+            SQLiteBackend.open(self.path())
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in raw.execute(
+                    "PRAGMA table_info(confirmations)"
+                )
+            }
+            boot = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()
+        finally:
+            raw.close()
+        self.assertEqual(version, "1")
+        self.assertNotIn("epoch", columns)
+        self.assertIsNone(boot)
+        # Retry after removing the fault migrates cleanly.
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute("DROP TRIGGER t_abort_meta")
+            raw.commit()
+        finally:
+            raw.close()
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        self.assertEqual(backend.get_policy(), make_policy())
+
+    def test_open_unknown_version_refused(self):
+        backend = self.create()
+        backend.close()
+        for bad in ("", "3", "v2", "02"):
+            raw = sqlite3.connect(self.path())
+            try:
+                raw.execute(
+                    "UPDATE meta SET value = ? "
+                    "WHERE key = 'schema_version'",
+                    (bad,),
+                )
+                raw.commit()
+            finally:
+                raw.close()
+            with open(self.path(), "rb") as handle:
+                before = handle.read()
+            with self.assertRaises(VerificationError, msg=bad):
+                SQLiteBackend.open(self.path())
+            with open(self.path(), "rb") as handle:
+                self.assertEqual(handle.read(), before)
+            raw = sqlite3.connect(self.path())
+            try:
+                kept = raw.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()[0]
+            finally:
+                raw.close()
+            self.assertEqual(kept, bad)
+
+    def test_open_missing_tables_refused(self):
+        for version in ("2", "1"):
+            name = "thin-%s.db" % version
+            raw = sqlite3.connect(self.path(name))
+            try:
+                raw.execute(
+                    "CREATE TABLE meta(key TEXT PRIMARY KEY, "
+                    "value TEXT NOT NULL)"
+                )
+                raw.execute(
+                    "INSERT INTO meta(key, value) VALUES "
+                    "('schema_version', ?)",
+                    (version,),
+                )
+                # Commit first: journal_mode cannot change inside the
+                # implicit transaction opened by the INSERT above, and
+                # the pragma would otherwise fail silently.
+                raw.commit()
+                mode = raw.execute(
+                    "PRAGMA journal_mode=WAL"
+                ).fetchone()[0]
+                self.assertEqual(str(mode).lower(), "wal")
+                raw.commit()
+            finally:
+                raw.close()
+            with open(self.path(name), "rb") as handle:
+                before = handle.read()
+            with self.assertRaises(VerificationError):
+                SQLiteBackend.open(self.path(name))
+            with open(self.path(name), "rb") as handle:
+                self.assertEqual(handle.read(), before)
+            raw = sqlite3.connect(self.path(name))
+            try:
+                tables = {
+                    row[0]
+                    for row in raw.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'table'"
+                    )
+                }
+                kept = raw.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()[0]
+            finally:
+                raw.close()
+            self.assertEqual(tables, {"meta"})
+            self.assertEqual(kept, version)
+        with self.assertRaises(VerificationError) as caught:
+            SQLiteBackend.open(self.path("thin-2.db"))
+        self.assertIn("missing tables", str(caught.exception))
+        self.assertIn("audit", str(caught.exception))
+        self.assertEqual(caught.exception.category, "schema_tables")
+
+    def test_open_nonmigratable_v1_refused(self):
+        backend = self.create(name="frank-a.db")
+        backend.close()
+        raw = sqlite3.connect(self.path("frank-a.db"))
+        try:
+            raw.execute(
+                "UPDATE meta SET value = '1' "
+                "WHERE key = 'schema_version'"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises(VerificationError):
+            SQLiteBackend.open(self.path("frank-a.db"))
+        self.make_v1_database(name="frank-b.db")
+        raw = sqlite3.connect(self.path("frank-b.db"))
+        try:
+            raw.execute(
+                "INSERT INTO counters(name, value) VALUES "
+                "('boot_epoch', 999)"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises(VerificationError):
+            SQLiteBackend.open(self.path("frank-b.db"))
+        raw = sqlite3.connect(self.path("frank-b.db"))
+        try:
+            kept = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            boot = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(kept, "1")
+        self.assertEqual(boot, 999)
 
 
 class TransactionTests(SQLiteCase):
@@ -488,6 +817,25 @@ class TransactionTests(SQLiteCase):
                 )
                 audit_seqs.append(record["seq"])
         self.assertEqual(audit_seqs, [2, 3])
+
+    def test_failed_begin_leaves_no_phantom_transaction(self):
+        backend = self.create()
+        backend.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            with backend.transaction():
+                pass
+        self.assertFalse(backend._in_transaction)
+
+    def test_policy_and_counter_writes_require_transaction(self):
+        backend = self.create()
+        with self.assertRaises(SQLiteBackendError):
+            backend.activate_policy(make_policy(version="v2"))
+        with self.assertRaises(SQLiteBackendError):
+            backend.add_daily_spent(10)
+        with self.assertRaises(SQLiteBackendError):
+            backend.reset_daily_spent()
+        self.assertEqual(backend.get_policy(), make_policy())
+        self.assertEqual(backend.get_daily_spent(), 0)
 
 
 class ContractParityTests(SQLiteCase):
@@ -683,6 +1031,29 @@ class ContractParityTests(SQLiteCase):
         self.assertEqual(cleared, 1)
         self.assertEqual(cleared, mem.confirmations.clear())
         self.assertEqual(sql.confirmations.pending_count(), 0)
+
+    def test_count_version_matches_purge_parity(self):
+        mem, sql = self._pair()
+        mem.confirmations.issue("transfer_money", "h", "v1")
+        mem.confirmations.issue("transfer_money", "h", "v1")
+        mem.confirmations.issue("transfer_money", "h", "v2")
+        with sql.transaction():
+            sql.confirmations.issue("transfer_money", "h", "v1")
+            sql.confirmations.issue("transfer_money", "h", "v1")
+            sql.confirmations.issue("transfer_money", "h", "v2")
+        for version, expected in (("v1", 2), ("v2", 1), ("v9", 0)):
+            self.assertEqual(
+                sql.confirmations.count_version(version), expected
+            )
+            self.assertEqual(
+                mem.confirmations.count_version(version), expected
+            )
+        # Read-only on both: purge still removes the counted tokens.
+        with sql.transaction():
+            purged = sql.confirmations.purge_version("v1")
+        self.assertEqual(purged, 2)
+        self.assertEqual(mem.confirmations.purge_version("v1"), 2)
+        self.assertEqual(sql.confirmations.count_version("v1"), 0)
 
     def test_ledger_journal_parity(self):
         mem, sql = self._pair()
