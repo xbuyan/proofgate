@@ -96,6 +96,28 @@ the spent-counter reset. If the append fails, nothing changes — the old
 policy stays active with its tokens intact — and the gate enters
 degraded mode instead of activating silently.
 
+## Idempotency keys (optional)
+
+A `transfer_money` request may carry `idempotency_key`: a caller-chosen
+bearer string (1-128 chars of letters, digits, hyphen, underscore).
+Same key plus same action and canonical arguments names the same
+intended operation; the key must be chosen before the first attempt so
+it survives lost responses and restarts. A retry returns the stored
+receipt (`duplicate: true`) instead of executing again; the same key
+with different arguments is denied as `operation_conflict` without
+executing. `operation_status(key)` reports `committed` (with receipt),
+`pending`, `not_found`, or `conflict`; `not_found` means no record in
+this database, never proof of non-execution elsewhere. Operation
+records survive `operator_reset` and restarts; confirmation expiry and
+epoch rules still govern every token. Keys are bearer identifiers:
+whoever presents one may query or retry its operation — cross-principal
+isolation is out of scope.
+
+Scope is strict: within one database, a matching key and fingerprint
+causes at most one committed synthetic-ledger transfer. Nothing here
+claims exactly-once execution against external services or providers;
+absence from this ledger is not proof an external action never ran.
+
 ## Audit, journal, ledger, reconciliation
 
 - The in-memory audit list is the only authoritative store. Every gate
@@ -217,6 +239,10 @@ by policy update); calendar-day rollover is out of scope.
   race, mixed load, policy-update atomicity (barriers/joins, no sleeps).
 - `test_failures.py` — cases A–D with byte-preservation and reconstruction,
   degraded reads, operator rules, export isolation, defensive branches.
+- `test_idempotency.py` — keyed at-most-once transfers, conflicts,
+  restarts, expiry, outcome lookup, reset preservation, serialization.
+- `test_crash_recovery.py` — real SIGKILL subprocess crashes before and
+  after commit on isolated databases, with safe retry (POSIX-only).
 
 ## Project layout
 

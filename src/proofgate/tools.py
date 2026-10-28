@@ -13,7 +13,15 @@ requires the gate-held mutator capability and raises
 mutates the ledger except through the enforcement entry point. A
 confirmation supplied for the read-only action is rejected as an
 unexpected argument.
+
+``transfer_money`` requests may carry an optional ``idempotency_key``:
+a caller-chosen bearer string (1-128 chars of letters, digits,
+hyphen, underscore) naming the intended operation. Same key plus same
+action/canonical-arguments means same operation; the key alone decides
+retry identity across lost responses and restarts.
 """
+
+import re
 
 from .canonical import arg_hash as _arg_hash
 from .ledger import _Mutator
@@ -24,6 +32,7 @@ __all__ = [
     "ValidationError",
     "get_balance",
     "transfer_money",
+    "is_valid_idempotency_key",
     "validate_args",
     "validate_request",
     "REASON_UNKNOWN_TOOL",
@@ -35,7 +44,9 @@ SUPPORTED_TOOLS = ("get_balance", "transfer_money")
 REASON_UNKNOWN_TOOL = "unknown_tool"
 REASON_INVALID_ARGS = "invalid_arguments"
 
-_REQUEST_KEYS = frozenset({"action", "actor", "args", "confirmation"})
+_REQUEST_KEYS = frozenset({
+    "action", "actor", "args", "confirmation", "idempotency_key",
+})
 _BALANCE_KEYS = frozenset({"account"})
 _TRANSFER_KEYS = frozenset({"source", "target", "amount"})
 
@@ -54,6 +65,17 @@ class ValidationError(Exception):
 
 class OperationNotAuthorized(Exception):
     """A mutation was attempted without the gate-held capability."""
+
+
+_IDEMPOTENCY_KEY_RE = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+
+
+def is_valid_idempotency_key(value):
+    """Return True for a well-formed caller idempotency key."""
+    return (
+        isinstance(value, str)
+        and _IDEMPOTENCY_KEY_RE.match(value) is not None
+    )
 
 
 def _best_effort_hash(args):
@@ -120,11 +142,13 @@ def validate_args(action, args):
 
 
 def validate_request(request):
-    """Validate a gate request; return ``(action, actor, args, token)``.
+    """Validate a gate request; return ``(action, actor, args, token,
+    key)``.
 
-    ``args`` is the normalized dict from :func:`validate_args` and
-    ``token`` is the confirmation string or ``None``. Any violation
-    raises :class:`ValidationError` carrying best-effort audit fields.
+    ``args`` is the normalized dict from :func:`validate_args``,
+    ``token`` is the confirmation string or ``None``, and ``key`` is
+    the idempotency key string or ``None``. Any violation raises
+    :class:`ValidationError` carrying best-effort audit fields.
     """
     if not isinstance(request, dict):
         raise ValidationError(REASON_INVALID_ARGS)
@@ -159,7 +183,18 @@ def validate_request(request):
             REASON_INVALID_ARGS, action=action,
             arg_hash=_best_effort_hash(request.get("args")), actor=actor,
         )
-    return (action, actor, args, token)
+    key = request.get("idempotency_key")
+    if key is not None and not is_valid_idempotency_key(key):
+        raise ValidationError(
+            REASON_INVALID_ARGS, action=action,
+            arg_hash=_best_effort_hash(request.get("args")), actor=actor,
+        )
+    if action == "get_balance" and key is not None:
+        raise ValidationError(
+            REASON_INVALID_ARGS, action=action,
+            arg_hash=_best_effort_hash(request.get("args")), actor=actor,
+        )
+    return (action, actor, args, token, key)
 
 
 def get_balance(ledger, account):

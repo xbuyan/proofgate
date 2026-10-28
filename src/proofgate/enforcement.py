@@ -9,8 +9,9 @@ the tool handler inside the critical section.
 Critical redemption order (all under the lock, no I/O or callbacks
 except the audit append, which is the fail-closed point)::
 
-    validate -> token check -> policy/live revalidation -> AUTHORIZED
-        -> consume -> journal -> ledger -> OUTCOME
+    validate -> token check -> [keyed: identity/conflict/status]
+        -> policy/live revalidation -> AUTHORIZED -> [keyed: bind]
+        -> consume -> journal -> ledger -> OUTCOME [+op complete]
 
 Response statuses: ``allowed``, ``confirmation_required``, ``denied``,
 ``error``, ``executed_recording_failed`` (mutation applied but the
@@ -40,6 +41,8 @@ from .tools import (
     transfer_money as apply_transfer,
 )
 from .tools import (
+    is_valid_idempotency_key,
+    validate_args,
     validate_request,
     ValidationError,
 )
@@ -68,6 +71,8 @@ REASON_VERSION_UNCHANGED = "version_unchanged"
 REASON_TOKEN_COMMIT_FAILED = "token_commit_failed"
 REASON_STORAGE_UNAVAILABLE = "storage_unavailable"
 REASON_OUTCOME_UNCERTAIN = "outcome_uncertain"
+REASON_OPERATION_CONFLICT = "operation_conflict"
+REASON_OPERATION_UNVERIFIABLE = "operation_unverifiable"
 
 ACTION_BALANCE = "get_balance"
 ACTION_TRANSFER = "transfer_money"
@@ -245,7 +250,9 @@ class Gate:
         """Validate, authorize, and execute one request."""
         with self._lock, self._storage.transaction():
             try:
-                action, actor, args, token = validate_request(request)
+                action, actor, args, token, key = validate_request(
+                    request
+                )
             except ValidationError as exc:
                 return self._deny(
                     exc.reason, action=exc.action,
@@ -257,8 +264,10 @@ class Gate:
             if action == ACTION_BALANCE:
                 return self._read_balance(actor, args, digest)
             if token is None:
-                return self._transfer_initial(actor, args, digest)
-            return self._transfer_redeem(actor, args, digest, token)
+                return self._transfer_initial(actor, args, digest, key)
+            return self._transfer_redeem(
+                actor, args, digest, token, key
+            )
 
     def _read_balance(self, actor, args, digest):
         permitted, reason = evaluate(
@@ -294,7 +303,69 @@ class Gate:
             "balance": balance,
         }
 
-    def _transfer_initial(self, actor, args, digest):
+    def _lookup_keyed_operation(self, key, action, digest):
+        """Return ``(record_or_None, is_conflict)``. Read-only."""
+        record = self._storage.get_operation(key)
+        if record is not None and (
+            record["action"], record["arg_hash"]
+        ) != (action, digest):
+            return None, True
+        return record, False
+
+    def _duplicate_return(self, actor, digest, record, token=None):
+        """Answer from the stored receipt; never executes anything.
+
+        Records a ``decision`` audit event (kind ``decision`` carries
+        no journal obligation, so reconciliation and cross-checks are
+        unaffected) and returns the committed receipt verbatim with a
+        duplicate marker. The caller learns the original outcome.
+        """
+        try:
+            self._record(
+                kind="decision", actor=actor,
+                action=record["action"], arg_hash=digest,
+                policy_version=self._storage.get_policy().version,
+                decision="duplicate", reason=REASON_OK,
+                token_id=(
+                    ConfirmationStore.token_id(token)
+                    if token is not None else None
+                ),
+            )
+        except AuditError:
+            self._set_degraded(
+                "audit_unavailable",
+                "duplicate decision unrecorded; nothing executed",
+            )
+            return {
+                "status": STATUS_ERROR,
+                "reason": REASON_AUDIT_UNAVAILABLE,
+            }
+        return {
+            "status": STATUS_ALLOWED,
+            "reason": REASON_OK,
+            "receipt": record["receipt"],
+            "duplicate": True,
+        }
+
+    def _transfer_initial(self, actor, args, digest, key):
+        if key is not None:
+            # Identity before authorization: a committed outcome is
+            # historical fact and must be returned even if live
+            # policy would deny a fresh attempt. Pending and absent
+            # keys still pass policy evaluation below.
+            record, conflict = self._lookup_keyed_operation(
+                key, ACTION_TRANSFER, digest
+            )
+            if conflict:
+                return self._deny(
+                    REASON_OPERATION_CONFLICT,
+                    action=ACTION_TRANSFER, digest=digest,
+                    actor=actor,
+                )
+            if record is not None and record["status"] == "committed":
+                return self._duplicate_return(actor, digest, record)
+        else:
+            record = None
         permitted, reason = evaluate(
             self._storage.get_policy(), ACTION_TRANSFER, args,
             self._live_state()
@@ -304,9 +375,14 @@ class Gate:
                 reason, action=ACTION_TRANSFER, digest=digest,
                 actor=actor,
             )
+        if key is not None and record is None:
+            self._storage.register_operation(
+                key, ACTION_TRANSFER, digest, actor
+            )
         token = self._confirmations.issue(
             ACTION_TRANSFER, digest,
             self._storage.get_policy().version,
+            op_key=key,
         )
         try:
             self._record(
@@ -332,7 +408,7 @@ class Gate:
             "confirmation": token,
         }
 
-    def _transfer_redeem(self, actor, args, digest, token):
+    def _transfer_redeem(self, actor, args, digest, token, key):
         try:
             self._confirmations.check(
                 token, ACTION_TRANSFER, digest,
@@ -343,6 +419,45 @@ class Gate:
                 exc.reason, action=ACTION_TRANSFER, digest=digest,
                 actor=actor,
             )
+        # Keyed identity resolution, before any authorization or
+        # mutation. Epoch/single-use checks above still govern the
+        # token itself; the operation record governs at-most-once.
+        token_op = self._storage.get_token_operation_key(token)
+        if (
+            key is not None and token_op is not None
+            and key != token_op
+        ):
+            return self._deny(
+                REASON_OPERATION_CONFLICT,
+                action=ACTION_TRANSFER, digest=digest,
+                actor=actor,
+            )
+        op_key = token_op if token_op is not None else key
+        record = None
+        if op_key is not None:
+            record, conflict = self._lookup_keyed_operation(
+                op_key, ACTION_TRANSFER, digest
+            )
+            if conflict:
+                return self._deny(
+                    REASON_OPERATION_CONFLICT,
+                    action=ACTION_TRANSFER, digest=digest,
+                    actor=actor,
+                )
+            if record is None and token_op is not None:
+                # Linked operation row missing: identity evidence is
+                # inconsistent (startup verification forbids this, so
+                # only mid-session tampering reaches here). Fail
+                # closed without executing.
+                return self._deny(
+                    REASON_OPERATION_CONFLICT,
+                    action=ACTION_TRANSFER, digest=digest,
+                    actor=actor,
+                )
+            if record is not None and record["status"] == "committed":
+                return self._duplicate_return(
+                    actor, digest, record, token
+                )
         permitted, reason = evaluate(
             self._storage.get_policy(), ACTION_TRANSFER, args,
             self._live_state()
@@ -370,6 +485,14 @@ class Gate:
                 "status": STATUS_ERROR,
                 "reason": REASON_AUDIT_UNAVAILABLE,
             }
+        if op_key is not None and record is None:
+            # Keyed request on an unlinked token: bind the identity
+            # before anything executes, so the attempt cannot escape
+            # idempotency even if this response is lost.
+            self._storage.register_operation(
+                op_key, ACTION_TRANSFER, digest, actor
+            )
+            self._storage.link_token_operation(token, op_key)
         try:
             self._confirmations.consume(token)
         except ConfirmationError:
@@ -441,19 +564,25 @@ class Gate:
                 "target": args["target"],
                 "amount": args["amount"],
             }
+        receipt = {
+            "action": ACTION_TRANSFER,
+            "source": args["source"],
+            "target": args["target"],
+            "amount": args["amount"],
+            "journal_seq": entry.seq,
+            "source_balance": new_source,
+            "target_balance": new_target,
+            "policy_version": self._storage.get_policy().version,
+        }
+        if op_key is not None:
+            # Atomic with everything above: the committed outcome
+            # and its receipt land in the same transaction as the
+            # consumption, journal, ledger, and audit writes.
+            self._storage.complete_operation(op_key, receipt)
         return {
             "status": STATUS_ALLOWED,
             "reason": REASON_OK,
-            "receipt": {
-                "action": ACTION_TRANSFER,
-                "source": args["source"],
-                "target": args["target"],
-                "amount": args["amount"],
-                "journal_seq": entry.seq,
-                "source_balance": new_source,
-                "target_balance": new_target,
-                "policy_version": self._storage.get_policy().version,
-            },
+            "receipt": receipt,
         }
 
     # ------------------------------------------------------------------
@@ -628,6 +757,84 @@ class Gate:
                 "pending_confirmations":
                     self._confirmations.pending_count(),
             }
+
+    def operation_status(self, key, action=None, args=None):
+        """Look up a caller operation by idempotency key. Read-only.
+
+        Returns ``committed`` (with the stored receipt), ``pending``,
+        or ``not_found``. ``not_found`` means no record exists in
+        this healthy database — never proof of non-execution
+        elsewhere. When ``action``/``args`` are supplied they are
+        validated and their fingerprint compared, yielding
+        ``conflict`` on mismatch. Never redeems, never mutates, never
+        authorizes a stale confirmation. Works while degraded; fails
+        closed with an ``error`` result when the record cannot be
+        read or verified.
+        """
+        if not is_valid_idempotency_key(key):
+            raise ValueError("invalid idempotency_key")
+        digest = None
+        if action is not None or args is not None:
+            if action != ACTION_TRANSFER or args is None:
+                raise ValueError(
+                    "fingerprint requires the transfer action and args"
+                )
+            try:
+                normalized = validate_args(action, args)
+            except ValidationError as exc:
+                raise ValueError("invalid fingerprint args") from exc
+            digest = arg_hash(normalized)
+        with self._lock:
+            try:
+                record = self._storage.get_operation(key)
+            except sqlite3.Error:
+                return {
+                    "status": STATUS_ERROR,
+                    "reason": REASON_STORAGE_UNAVAILABLE,
+                }
+            except SQLiteBackendError:
+                # The store answered but its record is invalid
+                # (e.g. unparseable receipt): data present, truth
+                # unavailable. Never mistaken for not_found.
+                return {
+                    "status": STATUS_ERROR,
+                    "reason": REASON_OPERATION_UNVERIFIABLE,
+                }
+            if record is None:
+                return {"status": "not_found", "key": key}
+            if not self._operation_record_valid(record):
+                return {
+                    "status": STATUS_ERROR,
+                    "reason": REASON_OPERATION_UNVERIFIABLE,
+                }
+            if digest is not None and (
+                record["action"], record["arg_hash"]
+            ) != (action, digest):
+                return {"status": "conflict", "key": key}
+            if record["status"] == "committed":
+                return {
+                    "status": "committed",
+                    "key": key,
+                    "receipt": record["receipt"],
+                }
+            return {"status": "pending", "key": key}
+
+    @staticmethod
+    def _operation_record_valid(record):
+        """Fail-closed shape check for a stored operation record."""
+        if record["status"] == "committed":
+            receipt_ok = isinstance(record["receipt"], dict)
+        elif record["status"] == "pending":
+            receipt_ok = record["receipt"] is None
+        else:
+            return False
+        return (
+            isinstance(record["action"], str)
+            and bool(record["action"])
+            and isinstance(record["arg_hash"], str)
+            and bool(record["arg_hash"])
+            and receipt_ok
+        )
 
     @_with_storage_boundary
     def check_health(self):

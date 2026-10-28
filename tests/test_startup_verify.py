@@ -118,11 +118,11 @@ class ValidDatabaseTests(VerifyCase):
         self._backends.append(backend)
         raw = sqlite3.connect(self.path())
         try:
-            summary = verify_database(raw, "2", _REQUIRED_TABLES)
+            summary = verify_database(raw, "3", _REQUIRED_TABLES)
         finally:
             raw.close()
-        self.assertEqual(summary["schema_version"], "2")
-        self.assertEqual(summary["tables"], 8)
+        self.assertEqual(summary["schema_version"], "3")
+        self.assertEqual(summary["tables"], 9)
         self.assertEqual(summary["opening_accounts"], 1)
         # The open above is one boot (S3): epoch 0 -> 1.
         self.assertEqual(summary["boot_epoch"], 1)
@@ -131,6 +131,7 @@ class ValidDatabaseTests(VerifyCase):
         self.assertEqual(summary["retired_versions"], 0)
         self.assertEqual(summary["ledger_accounts"], 2)
         self.assertEqual(summary["confirmations"], 1)
+        self.assertEqual(summary["operations"], 0)
         self.assertEqual(summary["journal_entries"], 1)
         self.assertEqual(summary["audit_records"], 5)
 
@@ -143,7 +144,7 @@ class IntegrityTests(VerifyCase):
         raw = sqlite3.connect(self.path())
         try:
             with self.assertRaises(VerificationError) as caught:
-                verify_database(raw, "2", _REQUIRED_TABLES)
+                verify_database(raw, "3", _REQUIRED_TABLES)
         finally:
             raw.close()
         self.assertEqual(caught.exception.category, "sqlite_integrity")
@@ -290,6 +291,82 @@ class LedgerConfirmationTests(VerifyCase):
             ("UPDATE confirmations SET token = ''", None),
         ])
         self.assert_refused_unmodified("g.db", "confirmations")
+
+
+class OperationTests(VerifyCase):
+    def insert_op(self, name, **overrides):
+        row = {
+            "op_key": "op-1",
+            "action": "transfer_money",
+            "arg_hash": "h",
+            "actor": "agent",
+            "status": "pending",
+            "receipt_json": None,
+            "created_epoch": 1,
+            "updated_epoch": 1,
+        }
+        row.update(overrides)
+        self.corrupt(name, [
+            ("INSERT INTO operations(op_key, action, arg_hash, "
+             "actor, status, receipt_json, created_epoch, "
+             "updated_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             (row["op_key"], row["action"], row["arg_hash"],
+              row["actor"], row["status"], row["receipt_json"],
+              row["created_epoch"], row["updated_epoch"])),
+        ])
+
+    def test_valid_operation_opens(self):
+        self.make_valid_database()
+        self.insert_op("g.db")
+        raw = sqlite3.connect(self.path())
+        try:
+            summary = verify_database(raw, "3", _REQUIRED_TABLES)
+        finally:
+            raw.close()
+        self.assertEqual(summary["operations"], 1)
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        record = backend.get_operation("op-1")
+        self.assertEqual(record["status"], "pending")
+
+    def test_bad_key_refused(self):
+        self.make_valid_database()
+        self.insert_op("g.db", op_key="has space")
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_bad_binding_refused(self):
+        self.make_valid_database()
+        self.insert_op("g.db", action="")
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_pending_receipt_refused(self):
+        self.make_valid_database()
+        self.insert_op("g.db", receipt_json='"surprise"')
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_bad_receipt_refused(self):
+        self.make_valid_database()
+        self.insert_op(
+            "g.db", status="committed", receipt_json="not-json"
+        )
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_committed_null_receipt_refused(self):
+        self.make_valid_database()
+        self.insert_op("g.db", status="committed")
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_bad_epoch_refused(self):
+        self.make_valid_database()
+        self.insert_op("g.db", created_epoch=-1)
+        self.assert_refused_unmodified("g.db", "operations")
+
+    def test_dangling_op_link_refused(self):
+        self.make_valid_database()
+        self.corrupt("g.db", [
+            ("UPDATE confirmations SET op_key = 'ghost'", None),
+        ])
+        self.assert_refused_unmodified("g.db", "operations")
 
 
 class JournalTests(VerifyCase):

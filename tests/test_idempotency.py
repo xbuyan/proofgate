@@ -1,0 +1,573 @@
+"""Keyed idempotency tests: at-most-once synthetic transfers.
+
+A caller-supplied ``idempotency_key`` plus the action/canonical-args
+fingerprint names one intended operation. Retries return the stored
+receipt instead of executing again, across lost responses, expiry,
+and restarts. Keyless behavior is unchanged.
+"""
+import os
+import sqlite3
+import sys
+import tempfile
+import threading
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from proofgate.audit import AuditError
+from proofgate.enforcement import Gate
+from proofgate.policy import Policy
+from proofgate.sqlite_backend import SQLiteBackend
+
+
+def make_policy(**overrides):
+    params = {
+        "version": "v1",
+        "per_transfer_cap": 500,
+        "daily_cap": 1000,
+        "allowed_targets": ("bob", "carol"),
+    }
+    params.update(overrides)
+    return Policy.create(**params)
+
+
+def args(amount=100, target="bob"):
+    return {"source": "alice", "target": target, "amount": amount}
+
+
+class FakeClock:
+    def __init__(self, value=1000.0):
+        self.value = float(value)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
+class IdempotencyCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._backends = []
+        self.addCleanup(self.tmp.cleanup)
+
+    def tearDown(self):
+        for backend in self._backends:
+            try:
+                backend.close()
+            except Exception:
+                pass
+
+    def path(self, name="g.db"):
+        return os.path.join(self.tmp.name, name)
+
+    def make_gate(self, name="g.db", policy=None, balances=None):
+        policy = policy if policy is not None else make_policy()
+        balances = (
+            balances if balances is not None else {"alice": 10000}
+        )
+        backend = SQLiteBackend.create(
+            self.path(name), policy=policy, balances=balances
+        )
+        self._backends.append(backend)
+        return Gate(policy=policy, storage=backend), backend
+
+    def reopen(self, backend, name="g.db"):
+        backend.close()
+        reopened = SQLiteBackend.open(self.path(name))
+        self._backends.append(reopened)
+        return (
+            Gate(policy=reopened.get_policy(), storage=reopened),
+            reopened,
+        )
+
+    def make_memory_gate(self, clock=None):
+        return Gate(
+            policy=make_policy(), balances={"alice": 10000},
+            clock=clock,
+        )
+
+    def initial(self, gate, key=None, **kwargs):
+        params = {"amount": 100, "target": "bob"}
+        params.update(kwargs)
+        request = {
+            "action": "transfer_money", "args": args(**params),
+        }
+        if key is not None:
+            request["idempotency_key"] = key
+        return gate.gate(request)
+
+    def redeem(self, gate, token, key=None, **kwargs):
+        params = {"amount": 100, "target": "bob"}
+        params.update(kwargs)
+        request = {
+            "action": "transfer_money", "args": args(**params),
+            "confirmation": token,
+        }
+        if key is not None:
+            request["idempotency_key"] = key
+        return gate.gate(request)
+
+    def kinds(self, gate):
+        return [r["kind"] for r in gate.audit_records()]
+
+    def decisions(self, gate):
+        return [
+            (r["kind"], r["decision"])
+            for r in gate.audit_records()
+        ]
+
+
+class SequentialDuplicateTests(IdempotencyCase):
+    def test_sequential_duplicate_returns_stored_receipt(self):
+        gate, _ = self.make_gate()
+        first = self.initial(gate, "op-1")
+        token = first["confirmation"]
+        allowed = self.redeem(gate, token, "op-1")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertNotIn("duplicate", allowed)
+        again = self.initial(gate, "op-1")
+        self.assertEqual(again["status"], "allowed")
+        self.assertEqual(again["reason"], "ok")
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["receipt"], allowed["receipt"])
+        # Exactly one execution behind both responses.
+        self.assertEqual(len(gate.journal_entries()), 1)
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        authorized = [
+            r for r in gate.audit_records()
+            if r["kind"] == "authorized"
+        ]
+        outcomes = [
+            r for r in gate.audit_records()
+            if r["kind"] == "outcome"
+        ]
+        self.assertEqual(len(authorized), 1)
+        self.assertEqual(len(outcomes), 1)
+        duplicates = [
+            r for r in gate.audit_records()
+            if r["decision"] == "duplicate"
+        ]
+        self.assertEqual(len(duplicates), 1)
+
+    def test_second_token_after_commit_returns_outcome(self):
+        gate, _ = self.make_gate()
+        first = self.initial(gate, "op-2")
+        second = self.initial(gate, "op-2")
+        self.assertEqual(first["status"], "confirmation_required")
+        self.assertEqual(second["status"], "confirmation_required")
+        self.assertNotEqual(
+            first["confirmation"], second["confirmation"]
+        )
+        allowed = self.redeem(gate, first["confirmation"], "op-2")
+        self.assertEqual(allowed["status"], "allowed")
+        # The other live token now resolves to the same outcome.
+        replay = self.redeem(gate, second["confirmation"], "op-2")
+        self.assertEqual(replay["status"], "allowed")
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["receipt"], allowed["receipt"])
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+    def test_pending_resumes_without_new_registration(self):
+        gate, _ = self.make_gate()
+        first = self.initial(gate, "op-3")
+        status = gate.operation_status("op-3")
+        self.assertEqual(status["status"], "pending")
+        second = self.initial(gate, "op-3")
+        self.assertEqual(second["status"], "confirmation_required")
+        allowed = self.redeem(gate, second["confirmation"], "op-3")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertEqual(len(gate.journal_entries()), 1)
+        # The first token resolves to the same committed outcome.
+        replay = self.redeem(gate, first["confirmation"], "op-3")
+        self.assertEqual(replay["status"], "allowed")
+        self.assertTrue(replay["duplicate"])
+        self.assertEqual(replay["receipt"], allowed["receipt"])
+
+    def test_committed_duplicate_ignores_later_policy(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "op-4")["confirmation"]
+        allowed = self.redeem(gate, token, "op-4")
+        self.assertEqual(allowed["status"], "allowed")
+        updated = gate.update_policy(make_policy(
+            version="v2", per_transfer_cap=10,
+        ))
+        self.assertEqual(updated["status"], "policy_updated")
+        # Live policy would deny a fresh 100-transfer, but the
+        # committed outcome is historical fact, not a new attempt.
+        again = self.initial(gate, "op-4")
+        self.assertEqual(again["status"], "allowed")
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["receipt"], allowed["receipt"])
+
+
+class ConflictTests(IdempotencyCase):
+    def test_same_key_different_args_conflicts(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "op-5")["confirmation"]
+        allowed = self.redeem(gate, token, "op-5")
+        self.assertEqual(allowed["status"], "allowed")
+        equivalent = self.initial(gate, "op-5", amount=200)
+        self.assertEqual(equivalent["status"], "denied")
+        self.assertEqual(
+            equivalent["reason"], "operation_conflict"
+        )
+        self.assertEqual(len(gate.journal_entries()), 1)
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        other_target = self.initial(gate, "op-5", target="carol")
+        self.assertEqual(other_target["reason"], "operation_conflict")
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+    def test_conflict_before_any_execution(self):
+        gate, _ = self.make_gate()
+        first = self.initial(gate, "op-6")
+        self.assertEqual(first["status"], "confirmation_required")
+        clash = self.initial(gate, "op-6", amount=50)
+        self.assertEqual(clash["status"], "denied")
+        self.assertEqual(clash["reason"], "operation_conflict")
+        # The pending operation is undisturbed and still resumable.
+        self.assertEqual(
+            gate.operation_status("op-6")["status"], "pending"
+        )
+        allowed = self.redeem(gate, first["confirmation"], "op-6")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+    def test_token_key_mismatch_conflicts(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "op-7")["confirmation"]
+        clash = self.redeem(gate, token, "op-other")
+        self.assertEqual(clash["status"], "denied")
+        self.assertEqual(clash["reason"], "operation_conflict")
+        self.assertEqual(len(gate.journal_entries()), 0)
+        self.assertEqual(
+            gate.operation_status("op-other")["status"], "not_found"
+        )
+        # The original operation still resumes cleanly.
+        allowed = self.redeem(gate, token, "op-7")
+        self.assertEqual(allowed["status"], "allowed")
+
+    def test_query_conflict_with_fingerprint(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "op-8")["confirmation"]
+        self.redeem(gate, token, "op-8")
+        match = gate.operation_status("op-8", "transfer_money",
+                                       args())
+        self.assertEqual(match["status"], "committed")
+        clash = gate.operation_status(
+            "op-8", "transfer_money", args(amount=7)
+        )
+        self.assertEqual(clash["status"], "conflict")
+
+
+class RestartExpiryTests(IdempotencyCase):
+    def test_duplicate_after_restart(self):
+        gate, backend = self.make_gate()
+        token = self.initial(gate, "op-9")["confirmation"]
+        allowed = self.redeem(gate, token, "op-9")
+        self.assertEqual(allowed["status"], "allowed")
+        gate2, _ = self.reopen(backend)
+        status = gate2.operation_status("op-9")
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["receipt"], allowed["receipt"])
+        again = self.initial(gate2, "op-9")
+        self.assertEqual(again["status"], "allowed")
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["receipt"], allowed["receipt"])
+        self.assertEqual(len(gate2.journal_entries()), 1)
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+
+    def test_stale_token_fresh_resume_after_restart(self):
+        gate, backend = self.make_gate()
+        old = self.initial(gate, "op-10")["confirmation"]
+        gate2, _ = self.reopen(backend)
+        stale = self.redeem(gate2, old, "op-10")
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        self.assertEqual(
+            gate2.operation_status("op-10")["status"], "pending"
+        )
+        fresh = self.initial(gate2, "op-10")["confirmation"]
+        allowed = self.redeem(gate2, fresh, "op-10")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertEqual(len(gate2.journal_entries()), 1)
+
+    def test_duplicate_after_confirmation_expiry(self):
+        clock = FakeClock()
+        gate = self.make_memory_gate(clock=clock)
+        token = self.initial(gate, "op-11")["confirmation"]
+        clock.advance(301.0)
+        expired = self.redeem(gate, token, "op-11")
+        self.assertEqual(expired["reason"], "confirmation_expired")
+        fresh = self.initial(gate, "op-11")["confirmation"]
+        allowed = self.redeem(gate, fresh, "op-11")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+
+class QueryTests(IdempotencyCase):
+    def test_query_lifecycle(self):
+        gate, _ = self.make_gate()
+        self.assertEqual(
+            gate.operation_status("op-12")["status"], "not_found"
+        )
+        token = self.initial(gate, "op-12")["confirmation"]
+        self.assertEqual(
+            gate.operation_status("op-12")["status"], "pending"
+        )
+        allowed = self.redeem(gate, token, "op-12")
+        status = gate.operation_status("op-12")
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["receipt"], allowed["receipt"])
+
+    def test_query_never_mutates(self):
+        gate, backend = self.make_gate()
+        token = self.initial(gate, "op-13")["confirmation"]
+        before = len(gate.audit_records())
+        self.redeem(gate, token, "op-13")
+        mid = len(gate.audit_records())
+        gate2, _ = self.reopen(backend)
+        records_before = len(gate2.audit_records())
+        gate2.operation_status("op-13")
+        gate2.operation_status("missing-key")
+        gate2.operation_status("op-13", "transfer_money", args())
+        self.assertEqual(len(gate2.audit_records()), records_before)
+        # Sanity on the fixture arithmetic, not on the query: the
+        # initial call appended one decision record (before), the
+        # redeem appended exactly authorized + outcome.
+        self.assertEqual(mid, before + 2)
+
+    def test_query_validates_key_and_fingerprint(self):
+        gate, _ = self.make_gate()
+        for bad in ("", "has space", "x" * 129, None, 42, b"op"):
+            with self.assertRaises(ValueError):
+                gate.operation_status(bad)
+        with self.assertRaises(ValueError):
+            gate.operation_status("op-14", "get_balance", args())
+        with self.assertRaises(ValueError):
+            gate.operation_status("op-14", "transfer_money")
+        with self.assertRaises(ValueError):
+            gate.operation_status(
+                "op-14", "transfer_money", {"bogus": 1}
+            )
+
+    def test_query_corrupt_receipt_fails_closed(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "op-15")["confirmation"]
+        self.redeem(gate, token, "op-15")
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute(
+                "UPDATE operations SET receipt_json = 'not-json' "
+                "WHERE op_key = 'op-15'"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        ledger_before = gate.ledger_snapshot()
+        journal_before = len(gate.journal_entries())
+        audit_before = len(gate.audit_records())
+        failed = gate.operation_status("op-15")
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(
+            failed["reason"], "operation_unverifiable"
+        )
+        self.assertNotEqual(failed["status"], "not_found")
+        # The failed query mutated nothing observable.
+        self.assertEqual(gate.ledger_snapshot(), ledger_before)
+        self.assertEqual(len(gate.journal_entries()), journal_before)
+        self.assertEqual(len(gate.audit_records()), audit_before)
+        raw = sqlite3.connect(self.path())
+        try:
+            blob = raw.execute(
+                "SELECT receipt_json FROM operations "
+                "WHERE op_key = 'op-15'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(blob, "not-json")
+
+    def test_query_closed_backend_errors(self):
+        gate, backend = self.make_gate()
+        self.initial(gate, "op-16")
+        backend.close()
+        failed = gate.operation_status("op-16")
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["reason"], "storage_unavailable")
+
+
+class KeyValidationTests(IdempotencyCase):
+    def test_malformed_keys_rejected(self):
+        gate, _ = self.make_gate()
+        for bad in ("", "has space", "semi;colon", "x" * 129):
+            response = gate.gate({
+                "action": "transfer_money", "args": args(),
+                "idempotency_key": bad,
+            })
+            self.assertEqual(response["status"], "denied")
+            self.assertEqual(
+                response["reason"], "invalid_arguments"
+            )
+        for bad in (None.__class__, 42, b"op-17", ["op-17"]):
+            response = gate.gate({
+                "action": "transfer_money", "args": args(),
+                "idempotency_key": bad,
+            })
+            self.assertEqual(response["status"], "denied")
+
+    def test_key_on_read_rejected(self):
+        gate, _ = self.make_gate()
+        response = gate.gate({
+            "action": "get_balance", "args": {"account": "alice"},
+            "idempotency_key": "op-18",
+        })
+        self.assertEqual(response["status"], "denied")
+        self.assertEqual(response["reason"], "invalid_arguments")
+
+    def test_keyless_requests_unchanged(self):
+        gate, _ = self.make_gate()
+        initial = gate.gate({
+            "action": "transfer_money", "args": args(),
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+        self.assertNotIn("duplicate", initial)
+        allowed = gate.gate({
+            "action": "transfer_money", "args": args(),
+            "confirmation": initial["confirmation"],
+        })
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertNotIn("duplicate", allowed)
+        self.assertNotIn("idempotency_key", allowed.get("receipt", {}))
+
+
+class ResetTests(IdempotencyCase):
+    def test_reset_preserves_operations(self):
+        gate, backend = self.make_gate()
+        token = self.initial(gate, "op-19")["confirmation"]
+        allowed = self.redeem(gate, token, "op-19")
+        self.assertEqual(allowed["status"], "allowed")
+
+        def fail_updated(kind):
+            if kind == "policy_updated":
+                raise AuditError("audit_unavailable")
+
+        backend.audit.fault_hook = fail_updated
+        result = gate.update_policy(make_policy(version="v2"))
+        self.assertEqual(result["reason"], "audit_unavailable")
+        self.assertTrue(gate.status()["degraded"])
+        backend.audit.fault_hook = None
+        cleared = gate.operator_reset()
+        self.assertEqual(cleared["status"], "reset")
+        # Tokens are wiped but the committed outcome survives.
+        gone = self.redeem(gate, token, "op-19")
+        self.assertEqual(gone["reason"], "invalid_confirmation")
+        status = gate.operation_status("op-19")
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["receipt"], allowed["receipt"])
+        again = self.initial(gate, "op-19")
+        self.assertEqual(again["status"], "allowed")
+        self.assertTrue(again["duplicate"])
+
+
+class RollbackTests(IdempotencyCase):
+    def test_statement_failure_rolls_back_keyed(self):
+        gate, backend = self.make_gate()
+        token = self.initial(gate, "op-20")["confirmation"]
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute(
+                "CREATE TRIGGER t_abort_journal BEFORE INSERT "
+                "ON journal "
+                "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        response = self.redeem(gate, token, "op-20")
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["reason"], "storage_unavailable")
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute("DROP TRIGGER t_abort_journal")
+            raw.commit()
+        finally:
+            raw.close()
+        gate2, _ = self.reopen(backend)
+        self.assertEqual(
+            gate2.operation_status("op-20")["status"], "pending"
+        )
+        fresh = self.initial(gate2, "op-20")["confirmation"]
+        allowed = self.redeem(gate2, fresh, "op-20")
+        self.assertEqual(allowed["status"], "allowed")
+        self.assertEqual(len(gate2.journal_entries()), 1)
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+
+    def test_operation_writes_roll_back_atomically(self):
+        _, backend = self.make_gate()
+        with self.assertRaises(RuntimeError):
+            with backend.transaction():
+                backend.register_operation(
+                    "op-21", "transfer_money", "h", "agent"
+                )
+                raise RuntimeError("injected")
+        self.assertIsNone(backend.get_operation("op-21"))
+        with backend.transaction():
+            backend.register_operation(
+                "op-22", "transfer_money", "h", "agent"
+            )
+        with self.assertRaises(RuntimeError):
+            with backend.transaction():
+                backend.complete_operation("op-22", {"ok": True})
+                raise RuntimeError("injected")
+        record = backend.get_operation("op-22")
+        self.assertEqual(record["status"], "pending")
+        self.assertIsNone(record["receipt"])
+
+
+class ConcurrencyTests(IdempotencyCase):
+    def test_same_key_serialized(self):
+        gate = self.make_memory_gate()
+        count = 8
+        barrier = threading.Barrier(count)
+        results = [None] * count
+
+        def worker(index):
+            barrier.wait()
+            initial = self.initial(gate, "op-23")
+            if initial["status"] == "confirmation_required":
+                token = initial["confirmation"]
+                results[index] = self.redeem(gate, token, "op-23")
+            else:
+                # Lost the race after commit: already the outcome.
+                results[index] = initial
+
+        threads = [
+            threading.Thread(target=worker, args=(index,))
+            for index in range(count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for response in results:
+            self.assertEqual(response["status"], "allowed")
+        receipts = [response["receipt"] for response in results]
+        for receipt in receipts:
+            self.assertEqual(receipt, receipts[0])
+        self.assertEqual(len(gate.journal_entries()), 1)
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

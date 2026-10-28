@@ -48,7 +48,7 @@ from .verify import VerificationError, verify_database
 
 __all__ = ["SCHEMA_VERSION", "SQLiteBackend", "SQLiteBackendError"]
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # One statement per entry (no splitting); DDL runs inside the seed
 # transaction so creation is atomic.
@@ -71,7 +71,18 @@ _SCHEMA = (
     "issued_at REAL NOT NULL, "
     "expires_at REAL NOT NULL, "
     "used INTEGER NOT NULL DEFAULT 0 CHECK (used IN (0, 1)), "
-    "epoch INTEGER NOT NULL)",
+    "epoch INTEGER NOT NULL, "
+    "op_key TEXT NULL)",
+    "CREATE TABLE operations("
+    "op_key TEXT PRIMARY KEY, "
+    "action TEXT NOT NULL, "
+    "arg_hash TEXT NOT NULL, "
+    "actor TEXT NOT NULL, "
+    "status TEXT NOT NULL "
+    "CHECK (status IN ('pending', 'committed')), "
+    "receipt_json TEXT NULL, "
+    "created_epoch INTEGER NOT NULL, "
+    "updated_epoch INTEGER NOT NULL)",
     "CREATE TABLE ledger("
     "account TEXT PRIMARY KEY, "
     "balance INTEGER NOT NULL CHECK (balance >= 0))",
@@ -105,12 +116,22 @@ _SCHEMA = (
 
 _REQUIRED_TABLES = frozenset({
     "meta", "policy_versions", "counters", "confirmations",
+    "ledger", "journal", "audit", "incidents", "operations",
+})
+
+_V2_TABLES = frozenset({
+    "meta", "policy_versions", "counters", "confirmations",
     "ledger", "journal", "audit", "incidents",
 })
 
 _V1_CONFIRMATION_COLUMNS = frozenset({
     "token", "action", "arg_hash", "policy_version",
     "issued_at", "expires_at", "used",
+})
+
+_V2_CONFIRMATION_COLUMNS = frozenset({
+    "token", "action", "arg_hash", "policy_version",
+    "issued_at", "expires_at", "used", "epoch",
 })
 
 
@@ -388,11 +409,12 @@ class _SQLiteConfirmations:
     def _fetch(self, token):
         return self._backend._conn.execute(
             "SELECT token, action, arg_hash, policy_version, issued_at, "
-            "expires_at, used, epoch FROM confirmations WHERE token = ?",
+            "expires_at, used, epoch, op_key "
+            "FROM confirmations WHERE token = ?",
             (token,),
         ).fetchone()
 
-    def issue(self, action, arg_hash, policy_version):
+    def issue(self, action, arg_hash, policy_version, op_key=None):
         backend = self._backend
         backend._require_transaction()
         now = backend._now()
@@ -403,12 +425,14 @@ class _SQLiteConfirmations:
         # invalidates this token. Zero survives only on rows
         # backfilled by the v1 migration, which are stale by the
         # same rule after the migrating open advances past 0.
+        # op_key optionally links the token to a caller operation;
+        # linkage never weakens the binding or epoch checks.
         backend._conn.execute(
             "INSERT INTO confirmations(token, action, arg_hash, "
-            "policy_version, issued_at, expires_at, used, epoch) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            "policy_version, issued_at, expires_at, used, epoch, "
+            "op_key) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
             (token, action, arg_hash, policy_version, now,
-             now + backend._ttl, backend._current_epoch()),
+             now + backend._ttl, backend._current_epoch(), op_key),
         )
         return token
 
@@ -636,12 +660,16 @@ class SQLiteBackend(StorageBackend):
         )
         try:
             version = cls._read_schema_version(backend, path)
+            if version == "1":
+                cls._migrate_v1_to_v2(backend, path)
+                version = "2"
+            if version == "2":
+                cls._migrate_v2_to_v3(backend, path)
+                version = "3"
             if version == SCHEMA_VERSION:
                 cls._require_tables(backend, path)
-            elif version == "1":
-                cls._migrate_v1_to_v2(backend, path)
             # Unknown versions fall through to the verifier, which
-            # refuses them; only v1 takes the migration path.
+            # refuses them; only v1 and v2 take migration paths.
             verify_database(
                 backend._conn, SCHEMA_VERSION, _REQUIRED_TABLES
             )
@@ -671,7 +699,7 @@ class SQLiteBackend(StorageBackend):
         return row["value"]
 
     @classmethod
-    def _require_tables(cls, backend, path):
+    def _require_tables(cls, backend, path, expected=None):
         """Refuse a database missing any required table."""
         tables = {
             row[0]
@@ -679,7 +707,7 @@ class SQLiteBackend(StorageBackend):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        missing = sorted(_REQUIRED_TABLES - tables)
+        missing = sorted((expected or _REQUIRED_TABLES) - tables)
         if missing:
             raise VerificationError(
                 "schema_tables",
@@ -695,7 +723,7 @@ class SQLiteBackend(StorageBackend):
         version flip then commit together. No audit records are
         touched and no semantic validity is claimed (S2 owns that).
         """
-        cls._require_tables(backend, path)
+        cls._require_tables(backend, path, _V2_TABLES)
         columns = {
             row["name"]
             for row in backend._conn.execute(
@@ -726,6 +754,61 @@ class SQLiteBackend(StorageBackend):
             backend._conn.execute(
                 "INSERT INTO counters(name, value) VALUES "
                 "('boot_epoch', 0)"
+            )
+            backend._conn.execute(
+                "UPDATE meta SET value = ? WHERE key = ?",
+                ("2", "schema_version"),
+            )
+
+    @classmethod
+    def _migrate_v2_to_v3(cls, backend, path):
+        """Migrate a verified v2 database to version 3, atomically.
+
+        Read-only pre-checks first; the operations table, the token
+        link column, and the version flip then commit together. No
+        audit records are touched. Pre-existing tokens keep a NULL
+        link and behave exactly as before (no idempotency).
+        """
+        cls._require_tables(backend, path, _V2_TABLES)
+        columns = {
+            row["name"]
+            for row in backend._conn.execute(
+                "PRAGMA table_info(confirmations)"
+            )
+        }
+        if columns != _V2_CONFIRMATION_COLUMNS:
+            raise VerificationError(
+                "schema_tables",
+                "refusing to migrate %r: confirmations table does not "
+                "match the expected version-2 schema" % (path,),
+            )
+        tables = {
+            row[0]
+            for row in backend._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "operations" in tables:
+            raise VerificationError(
+                "schema_tables",
+                "refusing to migrate %r: unexpected operations table "
+                "in a version-2 database" % (path,),
+            )
+        with backend.transaction():
+            backend._conn.execute(
+                "CREATE TABLE operations("
+                "op_key TEXT PRIMARY KEY, "
+                "action TEXT NOT NULL, "
+                "arg_hash TEXT NOT NULL, "
+                "actor TEXT NOT NULL, "
+                "status TEXT NOT NULL "
+                "CHECK (status IN ('pending', 'committed')), "
+                "receipt_json TEXT NULL, "
+                "created_epoch INTEGER NOT NULL, "
+                "updated_epoch INTEGER NOT NULL)"
+            )
+            backend._conn.execute(
+                "ALTER TABLE confirmations ADD COLUMN op_key TEXT NULL"
             )
             backend._conn.execute(
                 "UPDATE meta SET value = ? WHERE key = ?",
@@ -833,6 +916,98 @@ class SQLiteBackend(StorageBackend):
         if row is None:
             raise SQLiteBackendError("counter missing: 'boot_epoch'")
         return row["value"]
+
+    def _operation_from_row(self, row):
+        blob = row["receipt_json"]
+        if blob is not None:
+            try:
+                receipt = json.loads(blob)
+            except (TypeError, ValueError) as exc:
+                raise SQLiteBackendError(
+                    "operation receipt unparseable: %r"
+                    % (row["op_key"],)
+                ) from exc
+        else:
+            receipt = None
+        return {
+            "key": row["op_key"],
+            "action": row["action"],
+            "arg_hash": row["arg_hash"],
+            "actor": row["actor"],
+            "status": row["status"],
+            "receipt": receipt,
+            "created_epoch": row["created_epoch"],
+            "updated_epoch": row["updated_epoch"],
+        }
+
+    def get_operation(self, op_key):
+        """Return the operation record dict, or ``None`` if absent."""
+        row = self._conn.execute(
+            "SELECT op_key, action, arg_hash, actor, status, "
+            "receipt_json, created_epoch, updated_epoch "
+            "FROM operations WHERE op_key = ?",
+            (op_key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._operation_from_row(row)
+
+    def register_operation(self, op_key, action, arg_hash, actor):
+        """Store a ``pending`` record; duplicate keys fail closed."""
+        self._require_transaction()
+        epoch = self._current_epoch()
+        try:
+            self._conn.execute(
+                "INSERT INTO operations(op_key, action, arg_hash, "
+                "actor, status, receipt_json, created_epoch, "
+                "updated_epoch) VALUES (?, ?, ?, ?, 'pending', "
+                "NULL, ?, ?)",
+                (op_key, action, arg_hash, actor, epoch, epoch),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise SQLiteBackendError(
+                "operation already registered: %r" % (op_key,)
+            ) from exc
+        return self.get_operation(op_key)
+
+    def complete_operation(self, op_key, receipt):
+        """Flip ``pending`` to ``committed`` with the stored receipt."""
+        self._require_transaction()
+        blob = canonicalize(receipt).decode("utf-8")
+        cursor = self._conn.execute(
+            "UPDATE operations SET status = 'committed', "
+            "receipt_json = ?, updated_epoch = ? "
+            "WHERE op_key = ? AND status = 'pending'",
+            (blob, self._current_epoch(), op_key),
+        )
+        if cursor.rowcount != 1:
+            raise SQLiteBackendError(
+                "operation not pending: %r" % (op_key,)
+            )
+        return self.get_operation(op_key)
+
+    def get_token_operation_key(self, token):
+        """Return the linked operation key, or ``None``."""
+        row = self._conn.execute(
+            "SELECT op_key FROM confirmations WHERE token = ?",
+            (token,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["op_key"]
+
+    def link_token_operation(self, token, op_key):
+        """Attach *op_key* to an unlinked token."""
+        self._require_transaction()
+        cursor = self._conn.execute(
+            "UPDATE confirmations SET op_key = ? "
+            "WHERE token = ? AND op_key IS NULL",
+            (op_key, token),
+        )
+        if cursor.rowcount != 1:
+            raise SQLiteBackendError(
+                "token cannot be linked to an operation"
+            )
 
     def _next_seq(self, name):
         self._require_transaction()

@@ -66,6 +66,7 @@ class _Entry:
     issued_at: float
     expires_at: float
     used: bool = False
+    op_key: "str | None" = None
 
 
 def _eq(a, b):
@@ -101,8 +102,13 @@ class ConfirmationStore:
             self._latest = now
         return self._latest
 
-    def issue(self, action, arg_hash, policy_version):
-        """Issue a token bound to the given action, arg hash, and version."""
+    def issue(self, action, arg_hash, policy_version, op_key=None):
+        """Issue a token bound to action, arg hash, and version.
+
+        ``op_key`` optionally links the token to a caller operation;
+        linkage never weakens the binding, expiry, or single-use
+        checks, which ignore it.
+        """
         with self._lock:
             now = self._now_locked()
             token = secrets.token_urlsafe(32)
@@ -112,6 +118,7 @@ class ConfirmationStore:
                 binding=Binding(action, arg_hash, policy_version),
                 issued_at=now,
                 expires_at=now + self._ttl,
+                op_key=op_key,
             )
         return token
 

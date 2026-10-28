@@ -18,8 +18,8 @@ reported as gaps (the residue of an unrecorded outcome).
 
 Startup verification (:func:`verify_database`) runs the same read-only
 checks plus schema, metadata, policy, counter, ledger, confirmation,
-journal, and audit validation before a persisted backend may serve.
-It never writes.
+operation, journal, and audit validation before a persisted backend
+may serve. It never writes.
 """
 
 import json
@@ -28,6 +28,7 @@ import math
 from .audit import GENESIS_PREV_HASH, _verify_chain
 from .journal import JournalEntry
 from .policy import validate_policy_fields
+from .tools import is_valid_idempotency_key
 
 __all__ = [
     "VerificationError",
@@ -170,9 +171,10 @@ def verify_database(conn, expected_version, required_tables):
 
     Checks, in order: SQLite integrity (``PRAGMA quick_check``),
     schema version, required tables, metadata, policy, counters,
-    ledger, confirmations, journal continuity, the full audit chain,
-    and ledger/journal/audit reconciliation. Only ``SELECT`` and
-    ``PRAGMA`` statements run; no application state is written.
+    ledger, confirmations, operations, journal continuity, the full
+    audit chain, and ledger/journal/audit reconciliation. Only
+    ``SELECT`` and ``PRAGMA`` statements run; no application state is
+    written.
 
     Raises :class:`VerificationError` naming the failed category.
     Returns a summary dict on success. Positional row access only, so
@@ -368,6 +370,69 @@ def verify_database(conn, expected_version, required_tables):
                     stage, {"index": index, "problem": "bad_expiry"}
                 )
         summary["confirmations"] = len(confirm_rows)
+
+        stage = "operations"
+        op_keys = set()
+        for row in conn.execute(
+            "SELECT op_key, action, arg_hash, actor, status, "
+            "receipt_json, created_epoch, updated_epoch "
+            "FROM operations"
+        ):
+            key, action, arg_hash, actor = (
+                row[0], row[1], row[2], row[3]
+            )
+            status, blob, created, updated = (
+                row[4], row[5], row[6], row[7]
+            )
+            if not is_valid_idempotency_key(key):
+                raise VerificationError(
+                    stage, {"problem": "bad_key"}
+                )
+            if (
+                not isinstance(action, str) or not action
+                or not isinstance(arg_hash, str) or not arg_hash
+                or not isinstance(actor, str)
+            ):
+                raise VerificationError(
+                    stage, {"problem": "bad_binding"}
+                )
+            if status not in ("pending", "committed"):
+                raise VerificationError(
+                    stage, {"problem": "bad_status"}
+                )
+            if status == "pending":
+                if blob is not None:
+                    raise VerificationError(
+                        stage, {"problem": "pending_receipt"}
+                    )
+            else:
+                try:
+                    receipt = json.loads(blob)
+                except (TypeError, ValueError):
+                    raise VerificationError(
+                        stage, {"problem": "bad_receipt"}
+                    )
+                if not isinstance(receipt, dict):
+                    raise VerificationError(
+                        stage, {"problem": "bad_receipt"}
+                    )
+            if (
+                not _is_int(created) or created < 0
+                or not _is_int(updated) or updated < 0
+            ):
+                raise VerificationError(
+                    stage, {"problem": "bad_epoch"}
+                )
+            op_keys.add(key)
+        for row in conn.execute(
+            "SELECT op_key FROM confirmations "
+            "WHERE op_key IS NOT NULL"
+        ):
+            if row[0] not in op_keys:
+                raise VerificationError(
+                    stage, {"problem": "dangling_op_link"}
+                )
+        summary["operations"] = len(op_keys)
 
         stage = "journal"
         entries = []

@@ -8,6 +8,7 @@ single-process, and atomicity comes solely from the gate lock.
 
 import abc
 import contextlib
+import copy
 
 from .audit import AuditLog
 from .confirmations import ConfirmationStore, DEFAULT_TTL_SECONDS
@@ -42,6 +43,20 @@ class StorageBackend(abc.ABC):
     mutation capability for this backend's ledger. Write methods must
     be called inside ``transaction()``. Degraded state remains
     gate-held (in-memory) for this milestone.
+
+    Operation records bind a caller idempotency key to one intended
+    transfer: ``get_operation(key)`` returns the record dict or
+    ``None``; ``register_operation(key, action, arg_hash, actor)``
+    stores a ``pending`` record (duplicate keys fail closed);
+    ``complete_operation(key, receipt)`` flips ``pending`` to
+    ``committed`` with the stored receipt (anything else fails
+    closed); ``get_token_operation_key(token)`` returns the linked
+    key or ``None``; ``link_token_operation(token, key)`` attaches a
+    key to an unlinked token. Records are dicts with ``key``,
+    ``action``, ``arg_hash``, ``actor``, ``status``, ``receipt``
+    (``None`` until committed), ``created_epoch``, ``updated_epoch``.
+    Records survive ``confirmations.clear()``: wiping tokens must
+    never erase committed outcomes.
     """
 
     ledger = None
@@ -52,6 +67,31 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     def transaction(self):
         """Yield once per gate operation (see class contract)."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_operation(self, op_key):
+        """Return the operation record dict, or ``None`` if absent."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def register_operation(self, op_key, action, arg_hash, actor):
+        """Store a ``pending`` record; fail closed on duplicate keys."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def complete_operation(self, op_key, receipt):
+        """Flip ``pending`` to ``committed`` with the stored receipt."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def get_token_operation_key(self, token):
+        """Return the linked operation key, or ``None``."""
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def link_token_operation(self, token, op_key):
+        """Attach *op_key* to an unlinked token; fail closed."""
         raise NotImplementedError
 
 
@@ -76,6 +116,7 @@ class MemoryBackend(StorageBackend):
         self._retired_versions = set()
         self._daily_spent = 0
         self._opening = self.ledger.snapshot()
+        self._operations = {}
 
     @contextlib.contextmanager
     def transaction(self):
@@ -114,3 +155,54 @@ class MemoryBackend(StorageBackend):
     def get_opening_balances(self):
         """Return the construction balances for reconciliation."""
         return dict(self._opening)
+
+    def get_operation(self, op_key):
+        """Return a copy of the operation record, or ``None``."""
+        record = self._operations.get(op_key)
+        return copy.deepcopy(record) if record is not None else None
+
+    def register_operation(self, op_key, action, arg_hash, actor):
+        """Store a ``pending`` record; duplicate keys raise."""
+        if op_key in self._operations:
+            raise ValueError(
+                "operation already registered: %r" % (op_key,)
+            )
+        record = {
+            "key": op_key,
+            "action": action,
+            "arg_hash": arg_hash,
+            "actor": actor,
+            "status": "pending",
+            "receipt": None,
+            "created_epoch": 0,
+            "updated_epoch": 0,
+        }
+        self._operations[op_key] = record
+        return copy.deepcopy(record)
+
+    def complete_operation(self, op_key, receipt):
+        """Flip ``pending`` to ``committed`` with a copied receipt."""
+        record = self._operations.get(op_key)
+        if record is None or record["status"] != "pending":
+            raise ValueError(
+                "operation not pending: %r" % (op_key,)
+            )
+        record["status"] = "committed"
+        record["receipt"] = copy.deepcopy(receipt)
+        return copy.deepcopy(record)
+
+    def get_token_operation_key(self, token):
+        """Return the linked operation key, or ``None``."""
+        entry = self.confirmations._entries.get(token)
+        if entry is None:
+            return None
+        return entry.op_key
+
+    def link_token_operation(self, token, op_key):
+        """Attach *op_key* to an unlinked token."""
+        entry = self.confirmations._entries.get(token)
+        if entry is None or entry.op_key is not None:
+            raise ValueError(
+                "token cannot be linked to an operation"
+            )
+        entry.op_key = op_key

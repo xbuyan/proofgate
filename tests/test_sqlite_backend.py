@@ -123,10 +123,10 @@ class SchemaTests(SQLiteCase):
             tables,
             {
                 "meta", "policy_versions", "counters", "confirmations",
-                "ledger", "journal", "audit", "incidents",
+                "ledger", "journal", "audit", "incidents", "operations",
             },
         )
-        self.assertEqual(SCHEMA_VERSION, "2")
+        self.assertEqual(SCHEMA_VERSION, "3")
         self.assertEqual(backend.get_policy(), make_policy())
         self.assertEqual(backend.retired_versions(), frozenset())
         self.assertEqual(backend.get_daily_spent(), 0)
@@ -418,8 +418,12 @@ class SchemaVersionTests(SQLiteCase):
         raw = sqlite3.connect(self.path(name))
         try:
             raw.execute(
+                "ALTER TABLE confirmations DROP COLUMN op_key"
+            )
+            raw.execute(
                 "ALTER TABLE confirmations DROP COLUMN epoch"
             )
+            raw.execute("DROP TABLE operations")
             raw.execute(
                 "DELETE FROM counters WHERE name = 'boot_epoch'"
             )
@@ -444,7 +448,7 @@ class SchemaVersionTests(SQLiteCase):
         )
         return token
 
-    def test_create_seeds_version_2_and_boot_epoch(self):
+    def test_create_seeds_version_3_and_boot_epoch(self):
         backend = self.create()
         raw = sqlite3.connect(self.path())
         try:
@@ -460,12 +464,21 @@ class SchemaVersionTests(SQLiteCase):
                     "PRAGMA table_info(confirmations)"
                 )
             }
+            tables = {
+                row[0]
+                for row in raw.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table'"
+                )
+            }
         finally:
             raw.close()
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         self.assertEqual(version, SCHEMA_VERSION)
         self.assertEqual(epoch, 0)
         self.assertIn("epoch", columns)
+        self.assertIn("op_key", columns)
+        self.assertIn("operations", tables)
         with backend.transaction():
             token = backend.confirmations.issue(
                 "transfer_money", "h", "v1"
@@ -480,7 +493,7 @@ class SchemaVersionTests(SQLiteCase):
             raw.close()
         self.assertEqual(tuple(row), (0, 0))
 
-    def test_migrate_v1_to_v2(self):
+    def test_migrate_v1_to_v3(self):
         token = self.make_v1_database()
         backend = SQLiteBackend.open(self.path())
         self._backends.append(backend)
@@ -492,10 +505,11 @@ class SchemaVersionTests(SQLiteCase):
             epoch = raw.execute(
                 "SELECT value FROM counters WHERE name = 'boot_epoch'"
             ).fetchone()[0]
-            token_epoch = raw.execute(
-                "SELECT epoch FROM confirmations WHERE token = ?",
+            token_row = raw.execute(
+                "SELECT epoch, op_key FROM confirmations "
+                "WHERE token = ?",
                 (token,),
-            ).fetchone()[0]
+            ).fetchone()
             balance = raw.execute(
                 "SELECT balance FROM ledger WHERE account = 'alice'"
             ).fetchone()[0]
@@ -505,16 +519,20 @@ class SchemaVersionTests(SQLiteCase):
             audit_rows = raw.execute(
                 "SELECT COUNT(*) FROM audit"
             ).fetchone()[0]
+            op_rows = raw.execute(
+                "SELECT COUNT(*) FROM operations"
+            ).fetchone()[0]
         finally:
             raw.close()
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "3")
         # The opening migration is followed by one boot (S3): the
         # epoch advances 0 -> 1 with its audit evidence.
         self.assertEqual(epoch, 1)
-        self.assertEqual(token_epoch, 0)
+        self.assertEqual(tuple(token_row), (0, None))
         self.assertEqual(balance, 9900)
         self.assertEqual(journal_rows, 1)
         self.assertEqual(audit_rows, 3)
+        self.assertEqual(op_rows, 0)
         self.assertEqual(backend.get_policy(), make_policy())
         # Migrated store is fully functional.
         with backend.transaction():
@@ -577,11 +595,19 @@ class SchemaVersionTests(SQLiteCase):
         backend = SQLiteBackend.open(self.path())
         self._backends.append(backend)
         self.assertEqual(backend.get_policy(), make_policy())
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(version, "3")
 
     def test_open_unknown_version_refused(self):
         backend = self.create()
         backend.close()
-        for bad in ("", "3", "v2", "02"):
+        for bad in ("", "4", "v2", "02"):
             raw = sqlite3.connect(self.path())
             try:
                 raw.execute(
@@ -698,6 +724,157 @@ class SchemaVersionTests(SQLiteCase):
             raw.close()
         self.assertEqual(kept, "1")
         self.assertEqual(boot, 999)
+
+    def make_v2_database(self, name="g.db"):
+        """Build a true v2 database by downgrading a fresh create."""
+        backend = self.create(name=name)
+        with backend.transaction():
+            token = backend.confirmations.issue(
+                "transfer_money", "h", "v1"
+            )
+        backend.close()
+        raw = sqlite3.connect(self.path(name))
+        try:
+            raw.execute(
+                "ALTER TABLE confirmations DROP COLUMN op_key"
+            )
+            raw.execute("DROP TABLE operations")
+            raw.execute(
+                "UPDATE meta SET value = '2' "
+                "WHERE key = 'schema_version'"
+            )
+            raw.commit()
+            columns = {
+                row[1]
+                for row in raw.execute(
+                    "PRAGMA table_info(confirmations)"
+                )
+            }
+            tables = {
+                row[0]
+                for row in raw.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table'"
+                )
+            }
+        finally:
+            raw.close()
+        # Pin the fixture to the historical v2 contract.
+        self.assertEqual(
+            columns,
+            {"token", "action", "arg_hash", "policy_version",
+             "issued_at", "expires_at", "used", "epoch"},
+        )
+        self.assertNotIn("operations", tables)
+        return token
+
+    def test_migrate_v2_to_v3(self):
+        token = self.make_v2_database()
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            link = raw.execute(
+                "SELECT op_key FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()[0]
+            op_rows = raw.execute(
+                "SELECT COUNT(*) FROM operations"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(version, "3")
+        self.assertIsNone(link)
+        self.assertEqual(op_rows, 0)
+        self.assertEqual(backend.get_policy(), make_policy())
+        # Migrated store supports the operation lifecycle.
+        with backend.transaction():
+            backend.register_operation(
+                "op-m", "transfer_money", "h", "agent"
+            )
+            fresh = backend.confirmations.issue(
+                "transfer_money", "h", "v1", op_key="op-m"
+            )
+        self.assertEqual(
+            backend.get_token_operation_key(fresh), "op-m"
+        )
+        record = backend.get_operation("op-m")
+        self.assertEqual(record["status"], "pending")
+
+    def test_migrate_v2_rollback(self):
+        self.make_v2_database()
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute(
+                "CREATE TRIGGER t_abort_meta BEFORE UPDATE ON meta "
+                "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises(sqlite3.IntegrityError):
+            SQLiteBackend.open(self.path())
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+            columns = {
+                row[1]
+                for row in raw.execute(
+                    "PRAGMA table_info(confirmations)"
+                )
+            }
+            tables = {
+                row[0]
+                for row in raw.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table'"
+                )
+            }
+        finally:
+            raw.close()
+        self.assertEqual(version, "2")
+        self.assertNotIn("op_key", columns)
+        self.assertNotIn("operations", tables)
+        # Retry after removing the fault migrates cleanly.
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute("DROP TRIGGER t_abort_meta")
+            raw.commit()
+        finally:
+            raw.close()
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        self.assertEqual(backend.get_policy(), make_policy())
+        raw = sqlite3.connect(self.path())
+        try:
+            version = raw.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(version, "3")
+
+    def test_open_nonmigratable_v2_refused(self):
+        self.make_v2_database(name="grace-a.db")
+        raw = sqlite3.connect(self.path("grace-a.db"))
+        try:
+            raw.execute(
+                "CREATE TABLE operations(op_key TEXT PRIMARY KEY)"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with open(self.path("grace-a.db"), "rb") as handle:
+            before = handle.read()
+        with self.assertRaises(VerificationError):
+            SQLiteBackend.open(self.path("grace-a.db"))
+        with open(self.path("grace-a.db"), "rb") as handle:
+            self.assertEqual(handle.read(), before)
 
 
 class TransactionTests(SQLiteCase):
