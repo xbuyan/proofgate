@@ -46,7 +46,11 @@ from .tools import (
     validate_request,
     ValidationError,
 )
-from .verify import cross_check_journal_audit, reconcile
+from .verify import (
+    cross_check_journal_audit,
+    operation_receipt_consistent,
+    reconcile,
+)
 
 __all__ = ["Gate", "create_gate"]
 
@@ -307,19 +311,42 @@ class Gate:
         """Return ``(record_or_None, is_conflict)``. Read-only."""
         record = self._storage.get_operation(key)
         if record is not None and (
-            record["action"], record["arg_hash"]
-        ) != (action, digest):
+            (record["action"], record["arg_hash"])
+            != (action, digest)
+            # F2: same shape rule as the query path. Unreachable
+            # without mid-session tampering (startup verification
+            # and the writers forbid malformed rows); fail closed
+            # as a conflict so nothing executes on bad evidence.
+            or not self._operation_record_valid(record)
+        ):
             return None, True
         return record, False
 
     def _duplicate_return(self, actor, digest, record, token=None):
         """Answer from the stored receipt; never executes anything.
 
-        Records a ``decision`` audit event (kind ``decision`` carries
-        no journal obligation, so reconciliation and cross-checks are
-        unaffected) and returns the committed receipt verbatim with a
-        duplicate marker. The caller learns the original outcome.
+        The receipt is first bound to durable journal/OUTCOME
+        evidence; on mismatch the gate degrades and reports an
+        error instead of returning a falsified outcome. Records a
+        ``decision`` audit event (kind ``decision`` carries no
+        journal obligation, so reconciliation and cross-checks are
+        unaffected) and returns the committed receipt verbatim with
+        a duplicate marker. The caller learns the original outcome.
         """
+        problem = operation_receipt_consistent(
+            record["action"], record["arg_hash"], record["receipt"],
+            self._journal.entries(), self._audit.records,
+        )
+        if problem is not None:
+            self._set_degraded(
+                "operation_unverifiable",
+                "stored receipt inconsistent with evidence: %s"
+                % (problem,),
+            )
+            return {
+                "status": STATUS_ERROR,
+                "reason": REASON_OPERATION_UNVERIFIABLE,
+            }
         try:
             self._record(
                 kind="decision", actor=actor,
@@ -812,6 +839,16 @@ class Gate:
             ) != (action, digest):
                 return {"status": "conflict", "key": key}
             if record["status"] == "committed":
+                problem = operation_receipt_consistent(
+                    record["action"], record["arg_hash"],
+                    record["receipt"], self._journal.entries(),
+                    self._audit.records,
+                )
+                if problem is not None:
+                    return {
+                        "status": STATUS_ERROR,
+                        "reason": REASON_OPERATION_UNVERIFIABLE,
+                    }
                 return {
                     "status": "committed",
                     "key": key,

@@ -5,6 +5,7 @@ fingerprint names one intended operation. Retries return the stored
 receipt instead of executing again, across lost responses, expiry,
 and restarts. Keyless behavior is unchanged.
 """
+import json
 import os
 import sqlite3
 import sys
@@ -310,6 +311,116 @@ class RestartExpiryTests(IdempotencyCase):
         allowed = self.redeem(gate, fresh, "op-11")
         self.assertEqual(allowed["status"], "allowed")
         self.assertEqual(len(gate.journal_entries()), 1)
+
+
+class TamperedReceiptTests(IdempotencyCase):
+    def commit(self, gate, key):
+        token = self.initial(gate, key)["confirmation"]
+        allowed = self.redeem(gate, token, key)
+        self.assertEqual(allowed["status"], "allowed")
+        return allowed["receipt"]
+
+    def tamper_receipt(self, key, **changes):
+        raw = sqlite3.connect(self.path())
+        try:
+            blob = raw.execute(
+                "SELECT receipt_json FROM operations "
+                "WHERE op_key = ?",
+                (key,),
+            ).fetchone()[0]
+            receipt = json.loads(blob)
+            receipt.update(changes)
+            tampered = json.dumps(receipt)
+            raw.execute(
+                "UPDATE operations SET receipt_json = ? "
+                "WHERE op_key = ?",
+                (tampered, key),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        return tampered
+
+    def test_query_tampered_receipt_fails_closed(self):
+        gate, _ = self.make_gate()
+        self.commit(gate, "op-t1")
+        self.tamper_receipt("op-t1", amount=999)
+        ledger_before = gate.ledger_snapshot()
+        journal_before = len(gate.journal_entries())
+        audit_before = len(gate.audit_records())
+        failed = gate.operation_status("op-t1")
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(
+            failed["reason"], "operation_unverifiable"
+        )
+        self.assertEqual(gate.ledger_snapshot(), ledger_before)
+        self.assertEqual(len(gate.journal_entries()), journal_before)
+        self.assertEqual(len(gate.audit_records()), audit_before)
+        self.assertFalse(gate.status()["degraded"])
+
+    def test_duplicate_tampered_receipt_fails_closed(self):
+        gate, _ = self.make_gate()
+        genuine = self.commit(gate, "op-t2")
+        tampered = self.tamper_receipt(
+            "op-t2", source_balance=1, target_balance=2
+        )
+        ledger_before = gate.ledger_snapshot()
+        journal_before = len(gate.journal_entries())
+        audit_before = len(gate.audit_records())
+        failed = self.initial(gate, "op-t2")
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(
+            failed["reason"], "operation_unverifiable"
+        )
+        self.assertNotIn("receipt", failed)
+        self.assertTrue(gate.status()["degraded"])
+        self.assertEqual(
+            gate.status()["incident"]["case"],
+            "operation_unverifiable",
+        )
+        # No execution, no repair, no new evidence.
+        self.assertEqual(gate.ledger_snapshot(), ledger_before)
+        self.assertEqual(len(gate.journal_entries()), journal_before)
+        self.assertEqual(len(gate.audit_records()), audit_before)
+        raw = sqlite3.connect(self.path())
+        try:
+            blob = raw.execute(
+                "SELECT receipt_json FROM operations "
+                "WHERE op_key = 'op-t2'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(blob, tampered)
+        self.assertNotEqual(json.loads(blob)["source_balance"],
+                             genuine["source_balance"])
+
+    def test_query_ambiguous_outcome_fails_closed(self):
+        gate, _ = self.make_gate()
+        self.commit(gate, "op-t4")
+        raw = sqlite3.connect(self.path())
+        try:
+            # A second matching OUTCOME row (chain-breaking, so
+            # startup could never see it — runtime must still
+            # refuse the ambiguity rather than pick a match).
+            raw.execute(
+                "INSERT INTO audit(kind, seq, ts, actor, action, "
+                "arg_hash, policy_version, decision, reason, "
+                "token_id, extra_json, prev_hash, record_hash) "
+                "SELECT kind, (SELECT MAX(seq) + 1 FROM audit), "
+                "ts, actor, action, arg_hash, policy_version, "
+                "decision, reason, token_id, extra_json, "
+                "'forged', 'forged' "
+                "FROM audit WHERE kind = 'outcome' "
+                "AND decision = 'allowed' LIMIT 1"
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        failed = gate.operation_status("op-t4")
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(
+            failed["reason"], "operation_unverifiable"
+        )
 
 
 class QueryTests(IdempotencyCase):

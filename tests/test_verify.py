@@ -7,11 +7,15 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
-from proofgate.canonical import canonicalize
+from proofgate.canonical import arg_hash, canonicalize
 from proofgate.enforcement import Gate, create_gate
 from proofgate.journal import Journal
 from proofgate.policy import Policy
-from proofgate.verify import cross_check_journal_audit, reconcile
+from proofgate.verify import (
+    cross_check_journal_audit,
+    operation_receipt_consistent,
+    reconcile,
+)
 
 
 def make_policy(version="v1"):
@@ -251,6 +255,66 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual(
                 self.transfer(fresh)["status"], "allowed"
             )
+
+
+class ReceiptEvidenceTests(unittest.TestCase):
+    """Unit tests for committed-receipt evidence binding.
+
+    Duplicate matching OUTCOMEs cannot reach the startup stage
+    (a second OUTCOME row breaks the hash chain first), so the
+    ambiguity rule is pinned here at the pure-function level.
+    """
+
+    def genuine(self):
+        digest = arg_hash({
+            "source": "alice", "target": "bob", "amount": 100
+        })
+        journal = Journal()
+        journal.append_transfer("alice", "bob", 100)
+        receipt = {
+            "action": "transfer_money", "source": "alice",
+            "target": "bob", "amount": 100, "journal_seq": 1,
+            "source_balance": 9900, "target_balance": 100,
+            "policy_version": "v1",
+        }
+        outcome = {
+            "kind": "outcome", "seq": 4,
+            "action": "transfer_money", "arg_hash": digest,
+            "policy_version": "v1", "decision": "allowed",
+            "extra": {
+                "journal_seq": 1, "source_balance": 9900,
+                "target_balance": 100,
+            },
+        }
+        return digest, receipt, journal.entries(), [outcome]
+
+    def check(self, digest, receipt, entries, records):
+        return operation_receipt_consistent(
+            "transfer_money", digest, receipt, entries, records
+        )
+
+    def test_genuine_binding_consistent(self):
+        digest, receipt, entries, records = self.genuine()
+        self.assertIsNone(
+            self.check(digest, receipt, entries, records)
+        )
+
+    def test_duplicate_outcome_ambiguous(self):
+        digest, receipt, entries, records = self.genuine()
+        twin = dict(records[0])
+        twin["seq"] = 9
+        self.assertEqual(
+            self.check(digest, receipt, entries, records + [twin]),
+            "ambiguous_outcome",
+        )
+
+    def test_unrelated_outcome_ignored(self):
+        digest, receipt, entries, records = self.genuine()
+        other = dict(records[0])
+        other["arg_hash"] = "0" * 64
+        self.assertIsNone(
+            self.check(digest, receipt, entries, records + [other])
+        )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ import json
 import math
 
 from .audit import GENESIS_PREV_HASH, _verify_chain
+from .canonical import arg_hash
 from .journal import JournalEntry
 from .policy import validate_policy_fields
 from .tools import is_valid_idempotency_key
@@ -33,6 +34,7 @@ from .tools import is_valid_idempotency_key
 __all__ = [
     "VerificationError",
     "cross_check_journal_audit",
+    "operation_receipt_consistent",
     "reconcile",
     "verify_database",
 ]
@@ -166,15 +168,107 @@ def _audit_record_from_row(row):
     }
 
 
+def operation_receipt_consistent(op_action, op_arg_hash, receipt,
+                                 journal_entries, audit_records):
+    """Check a committed receipt against durable evidence.
+
+    Returns ``None`` when the receipt matches a real journal entry
+    and exactly one ``allowed`` OUTCOME record bound to the
+    operation's own action and argument hash; otherwise returns a
+    short problem code (``bad_receipt_shape``,
+    ``fingerprint_mismatch``, ``journal_mismatch``,
+    ``outcome_missing``, or ``ambiguous_outcome``). Pure function
+    shared by startup verification and the runtime duplicate/query
+    paths, so all three enforce the same invariant. Deliberately
+    content-level: shape checks alone cannot catch a valid-JSON
+    receipt with falsified values. The journal carries no argument
+    hash, so the binding is closed by recomputing the fingerprint
+    from the receipt's own arguments (deterministic canonical hash;
+    identical input reproduces the stored digest exactly). No
+    protection is claimed against an attacker who rewrites the
+    whole database and recomputes every unkeyed hash.
+    """
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("action") != op_action
+        or not isinstance(receipt.get("source"), str)
+        or not receipt.get("source")
+        or not isinstance(receipt.get("target"), str)
+        or not receipt.get("target")
+        or not _is_int(receipt.get("amount"))
+        or receipt.get("amount") <= 0
+        or not _is_int(receipt.get("journal_seq"))
+        or receipt.get("journal_seq") < 1
+        or not _is_int(receipt.get("source_balance"))
+        or receipt.get("source_balance") < 0
+        or not _is_int(receipt.get("target_balance"))
+        or receipt.get("target_balance") < 0
+        or not isinstance(receipt.get("policy_version"), str)
+        or not receipt.get("policy_version")
+    ):
+        return "bad_receipt_shape"
+    if (
+        arg_hash({
+            "source": receipt["source"],
+            "target": receipt["target"],
+            "amount": receipt["amount"],
+        })
+        != op_arg_hash
+    ):
+        return "fingerprint_mismatch"
+    seq = receipt["journal_seq"]
+    for entry in journal_entries:
+        if entry.seq != seq:
+            continue
+        if (
+            entry.action != op_action
+            or entry.source != receipt["source"]
+            or entry.target != receipt["target"]
+            or entry.amount != receipt["amount"]
+        ):
+            return "journal_mismatch"
+        break
+    else:
+        return "journal_mismatch"
+    matches = 0
+    for record in audit_records:
+        if record.get("kind") != "outcome":
+            continue
+        if record.get("decision") != "allowed":
+            continue
+        if record.get("action") != op_action:
+            continue
+        if record.get("arg_hash") != op_arg_hash:
+            continue
+        if record.get("policy_version") != receipt["policy_version"]:
+            continue
+        extra = record.get("extra")
+        if not isinstance(extra, dict):
+            continue
+        if (
+            extra.get("journal_seq") == seq
+            and extra.get("source_balance")
+            == receipt["source_balance"]
+            and extra.get("target_balance")
+            == receipt["target_balance"]
+        ):
+            matches += 1
+    if matches == 0:
+        return "outcome_missing"
+    if matches > 1:
+        return "ambiguous_outcome"
+    return None
+
+
 def verify_database(conn, expected_version, required_tables):
     """Verify a ProofGate database for startup. Read-only.
 
     Checks, in order: SQLite integrity (``PRAGMA quick_check``),
     schema version, required tables, metadata, policy, counters,
     ledger, confirmations, operations, journal continuity, the full
-    audit chain, and ledger/journal/audit reconciliation. Only
-    ``SELECT`` and ``PRAGMA`` statements run; no application state is
-    written.
+    audit chain, ledger/journal/audit reconciliation, and committed
+    receipt evidence binding. Only ``SELECT`` and ``PRAGMA``
+    statements run; no application state is written.
 
     Raises :class:`VerificationError` naming the failed category.
     Returns a summary dict on success. Positional row access only, so
@@ -373,6 +467,7 @@ def verify_database(conn, expected_version, required_tables):
 
         stage = "operations"
         op_keys = set()
+        committed = []
         for row in conn.execute(
             "SELECT op_key, action, arg_hash, actor, status, "
             "receipt_json, created_epoch, updated_epoch "
@@ -416,6 +511,7 @@ def verify_database(conn, expected_version, required_tables):
                     raise VerificationError(
                         stage, {"problem": "bad_receipt"}
                     )
+                committed.append((action, arg_hash, receipt))
             if (
                 not _is_int(created) or created < 0
                 or not _is_int(updated) or updated < 0
@@ -519,6 +615,19 @@ def verify_database(conn, expected_version, required_tables):
                     ][:8],
                 },
             )
+
+        stage = "operation_evidence"
+        for index, (op_action, op_arg_hash, receipt) in enumerate(
+            committed
+        ):
+            problem = operation_receipt_consistent(
+                op_action, op_arg_hash, receipt, entries, records
+            )
+            if problem is not None:
+                raise VerificationError(
+                    stage,
+                    {"index": index, "problem": problem},
+                )
     except VerificationError:
         raise
     except Exception as exc:

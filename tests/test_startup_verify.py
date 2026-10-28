@@ -6,6 +6,7 @@ byte-identical afterwards (verification never writes), and no usable
 backend escapes. Corruption is crafted with direct SQL against
 temporary files only.
 """
+import json
 import os
 import sqlite3
 import sys
@@ -14,6 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from proofgate.enforcement import Gate
 from proofgate.policy import Policy
 from proofgate.sqlite_backend import (
     SQLiteBackend,
@@ -367,6 +369,116 @@ class OperationTests(VerifyCase):
             ("UPDATE confirmations SET op_key = 'ghost'", None),
         ])
         self.assert_refused_unmodified("g.db", "operations")
+
+    def make_committed_op_database(self, name="g.db", key="op-1"):
+        """Build a database with one genuine committed operation."""
+        backend = self.create(name=name)
+        gate = Gate(policy=make_policy(), storage=backend)
+        initial = gate.gate({
+            "action": "transfer_money",
+            "args": {"source": "alice", "target": "bob",
+                     "amount": 100},
+            "idempotency_key": key,
+        })
+        allowed = gate.gate({
+            "action": "transfer_money",
+            "args": {"source": "alice", "target": "bob",
+                     "amount": 100},
+            "confirmation": initial["confirmation"],
+            "idempotency_key": key,
+        })
+        self.assertEqual(allowed["status"], "allowed")
+        backend.close()
+        return self.path(name)
+
+    def tamper_receipt(self, name, key, **changes):
+        raw = sqlite3.connect(self.path(name))
+        try:
+            blob = raw.execute(
+                "SELECT receipt_json FROM operations "
+                "WHERE op_key = ?",
+                (key,),
+            ).fetchone()[0]
+            receipt = json.loads(blob)
+            receipt.update(changes)
+            raw.execute(
+                "UPDATE operations SET receipt_json = ? "
+                "WHERE op_key = ?",
+                (json.dumps(receipt), key),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def test_committed_operation_verifies(self):
+        self.make_committed_op_database()
+        backend = SQLiteBackend.open(self.path())
+        self._backends.append(backend)
+        record = backend.get_operation("op-1")
+        self.assertEqual(record["status"], "committed")
+        raw = sqlite3.connect(self.path())
+        try:
+            summary = verify_database(raw, "3", _REQUIRED_TABLES)
+        finally:
+            raw.close()
+        self.assertEqual(summary["operations"], 1)
+
+    def test_altered_receipt_amount_refused(self):
+        self.make_committed_op_database()
+        self.tamper_receipt("g.db", "op-1", amount=999)
+        exc = self.assert_refused_unmodified(
+            "g.db", "operation_evidence"
+        )
+        # Amount tampering breaks the fingerprint first: the
+        # receipt's own arguments no longer hash to the binding.
+        self.assertEqual(exc.detail["problem"], "fingerprint_mismatch")
+
+    def test_consistent_amount_tamper_refused(self):
+        # Tamper journal, ledger, and receipt together so replay,
+        # cross-check, and value comparisons all still agree: only
+        # the fingerprint recomputation can catch it.
+        self.make_committed_op_database()
+        self.tamper_receipt("g.db", "op-1", amount=50)
+        self.corrupt("g.db", [
+            ("UPDATE journal SET amount = 50 WHERE seq = 1", None),
+            ("UPDATE ledger SET balance = 9950 "
+             "WHERE account = 'alice'", None),
+            ("UPDATE ledger SET balance = 50 "
+             "WHERE account = 'bob'", None),
+        ])
+        exc = self.assert_refused_unmodified(
+            "g.db", "operation_evidence"
+        )
+        self.assertEqual(exc.detail["problem"], "fingerprint_mismatch")
+
+    def test_altered_receipt_seq_refused(self):
+        self.make_committed_op_database()
+        self.tamper_receipt("g.db", "op-1", journal_seq=99)
+        exc = self.assert_refused_unmodified(
+            "g.db", "operation_evidence"
+        )
+        self.assertEqual(exc.detail["problem"], "journal_mismatch")
+
+    def test_altered_receipt_balances_refused(self):
+        self.make_committed_op_database()
+        self.tamper_receipt(
+            "g.db", "op-1", source_balance=1, target_balance=2
+        )
+        exc = self.assert_refused_unmodified(
+            "g.db", "operation_evidence"
+        )
+        self.assertEqual(exc.detail["problem"], "outcome_missing")
+
+    def test_empty_receipt_dict_refused(self):
+        self.make_committed_op_database()
+        self.corrupt("g.db", [
+            ("UPDATE operations SET receipt_json = '{}' "
+             "WHERE op_key = 'op-1'", None),
+        ])
+        exc = self.assert_refused_unmodified(
+            "g.db", "operation_evidence"
+        )
+        self.assertEqual(exc.detail["problem"], "bad_receipt_shape")
 
 
 class JournalTests(VerifyCase):
