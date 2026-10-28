@@ -30,6 +30,7 @@ __all__ = [
     "REASON_EXPIRED",
     "REASON_MISMATCH",
     "REASON_SUPERSEDED",
+    "REASON_STALE",
 ]
 
 DEFAULT_TTL_SECONDS = 300
@@ -39,6 +40,7 @@ REASON_REUSED = "confirmation_reused"
 REASON_EXPIRED = "confirmation_expired"
 REASON_MISMATCH = "confirmation_mismatch"
 REASON_SUPERSEDED = "policy_superseded"
+REASON_STALE = "confirmation_stale"
 
 
 class ConfirmationError(Exception):

@@ -33,6 +33,7 @@ from .confirmations import (
     REASON_EXPIRED,
     REASON_MISMATCH,
     REASON_SUPERSEDED,
+    REASON_STALE,
     Binding,
     ConfirmationError,
     DEFAULT_TTL_SECONDS,
@@ -374,7 +375,7 @@ class _SQLiteAuditLog:
 
 
 class _SQLiteConfirmations:
-    """Confirmation facade: same check matrix as ConfirmationStore."""
+    """Confirmation facade: store matrix plus boot-epoch binding."""
 
     def __init__(self, backend):
         self._backend = backend
@@ -387,7 +388,7 @@ class _SQLiteConfirmations:
     def _fetch(self, token):
         return self._backend._conn.execute(
             "SELECT token, action, arg_hash, policy_version, issued_at, "
-            "expires_at, used FROM confirmations WHERE token = ?",
+            "expires_at, used, epoch FROM confirmations WHERE token = ?",
             (token,),
         ).fetchone()
 
@@ -398,16 +399,16 @@ class _SQLiteConfirmations:
         token = secrets.token_urlsafe(32)
         while self._fetch(token) is not None:
             token = secrets.token_urlsafe(32)
-        # Transitional value: the column is NOT NULL but epoch
-        # binding, sweeping, and enforcement arrive after S3 (which
-        # advances the counter only). Zero matches the v1 migration
-        # backfill; no current code reads this column.
+        # S4: stamp the active boot epoch so a later restart
+        # invalidates this token. Zero survives only on rows
+        # backfilled by the v1 migration, which are stale by the
+        # same rule after the migrating open advances past 0.
         backend._conn.execute(
             "INSERT INTO confirmations(token, action, arg_hash, "
             "policy_version, issued_at, expires_at, used, epoch) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+            "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
             (token, action, arg_hash, policy_version, now,
-             now + backend._ttl),
+             now + backend._ttl, backend._current_epoch()),
         )
         return token
 
@@ -419,6 +420,11 @@ class _SQLiteConfirmations:
             raise ConfirmationError(REASON_REUSED)
         if self._backend._now() >= row["expires_at"]:
             raise ConfirmationError(REASON_EXPIRED)
+        # Temporal validity before binding comparisons: any epoch
+        # other than the active one (older, newer, or NULL) is
+        # stale. Fail-closed: inequality alone rejects.
+        if row["epoch"] != self._backend._current_epoch():
+            raise ConfirmationError(REASON_STALE)
         if not _eq(row["policy_version"], policy_version):
             raise ConfirmationError(REASON_SUPERSEDED)
         if not (
@@ -737,12 +743,7 @@ class SQLiteBackend(StorageBackend):
         arrives separately; this step advances and records only.
         """
         with backend.transaction():
-            row = backend._conn.execute(
-                "SELECT value FROM counters WHERE name = 'boot_epoch'"
-            ).fetchone()
-            if row is None:
-                raise SQLiteBackendError("counter missing: 'boot_epoch'")
-            prior_epoch = row[0]
+            prior_epoch = backend._current_epoch()
             new_epoch = prior_epoch + 1
             backend._conn.execute(
                 "UPDATE counters SET value = ? "
@@ -823,6 +824,15 @@ class SQLiteBackend(StorageBackend):
         return self._latest
 
     # -- small data access -------------------------------------------
+
+    def _current_epoch(self):
+        """Return the active boot epoch; fail closed if missing."""
+        row = self._conn.execute(
+            "SELECT value FROM counters WHERE name = 'boot_epoch'"
+        ).fetchone()
+        if row is None:
+            raise SQLiteBackendError("counter missing: 'boot_epoch'")
+        return row["value"]
 
     def _next_seq(self, name):
         self._require_transaction()

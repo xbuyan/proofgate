@@ -21,6 +21,7 @@ from proofgate.confirmations import (
     REASON_MISMATCH,
     REASON_REUSED,
     REASON_SUPERSEDED,
+    REASON_STALE,
     Binding,
     ConfirmationError,
 )
@@ -369,11 +370,22 @@ class OpenTests(SQLiteCase):
              boot["extra"]["new_epoch"]),
             (0, 1),
         )
+        # S4: the pre-restart token persists but is stale; a
+        # fresh token issued in the new epoch validates normally.
+        with self.assertRaises(ConfirmationError) as caught:
+            backend.confirmations.check(
+                token, "transfer_money", "h", "v1"
+            )
+        self.assertEqual(caught.exception.reason, REASON_STALE)
+        with backend.transaction():
+            fresh = backend.confirmations.issue(
+                "transfer_money", "h2", "v1"
+            )
         binding = backend.confirmations.check(
-            token, "transfer_money", "h", "v1"
+            fresh, "transfer_money", "h2", "v1"
         )
         self.assertEqual(
-            binding, Binding("transfer_money", "h", "v1")
+            binding, Binding("transfer_money", "h2", "v1")
         )
         self.assertEqual(
             backend.ledger.snapshot(),
@@ -513,13 +525,13 @@ class SchemaVersionTests(SQLiteCase):
             fresh, "transfer_money", "h2", "v1"
         )
         self.assertEqual(binding.policy_version, "v1")
-        # Transitional semantic: pre-existing tokens are NOT yet
-        # invalidated (epoch enforcement and sweeping arrive after
-        # S3, which advances the counter only).
-        old = backend.confirmations.check(
-            token, "transfer_money", "h", "v1"
-        )
-        self.assertEqual(old.action, "transfer_money")
+        # S4: the migrated v1 token (epoch 0) is stale after
+        # the migrating open advanced to epoch 1.
+        with self.assertRaises(ConfirmationError) as caught:
+            backend.confirmations.check(
+                token, "transfer_money", "h", "v1"
+            )
+        self.assertEqual(caught.exception.reason, REASON_STALE)
 
     def test_migrate_v1_rollback(self):
         self.make_v1_database()

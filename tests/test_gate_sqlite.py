@@ -217,15 +217,29 @@ class DurablePolicyTests(GateSQLiteCase):
         self.assertEqual(gate.status()["policy_version"], "v1")
         self.assertTrue(gate.status()["degraded"])
         gate2, _ = self.reopen(backend)
-        # Atomicity: no purge happened, so the old token survives and
-        # redeems under v1 on the reopened (non-degraded) gate.
+        # Atomicity: no purge happened, so the old token row
+        # survives unused; S4 makes it stale (issued pre-restart),
+        # so the reopened gate rejects it without mutating state.
         self.assertEqual(gate2.status()["policy_version"], "v1")
         self.assertEqual(gate2.status()["daily_spent"], 0)
-        redeemed = do_redeem(gate2, token)
-        self.assertEqual(redeemed["status"], "allowed")
         self.assertEqual(
-            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+            gate2.status()["pending_confirmations"], 1
         )
+        stale = do_redeem(gate2, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        self.assertEqual(gate2.ledger_snapshot(), {"alice": 10000})
+        self.assertEqual(len(gate2.journal_entries()), 0)
+        raw = sqlite3.connect(self.path())
+        try:
+            row = raw.execute(
+                "SELECT used, epoch FROM confirmations "
+                "WHERE token = ?",
+                (token,),
+            ).fetchone()
+        finally:
+            raw.close()
+        self.assertEqual(tuple(row), (0, 0))
 
 
 class ConstructionTests(GateSQLiteCase):
@@ -270,10 +284,23 @@ class StorageFailureTests(GateSQLiteCase):
         self.assertEqual(
             kinds(gate2), ["genesis", "decision", "boot"]
         )
-        # Retry after removing the fault succeeds with the SAME token:
-        # consumption was rolled back, so no retry hazard exists.
+        # S4: the pre-restart token is stale now. Consumption
+        # rollback is proven by its unused row; retry proceeds with
+        # a fresh token issued in the new epoch.
         self.drop_trigger("g.db")
-        retry = do_redeem(gate2, token)
+        stale = do_redeem(gate2, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        raw = sqlite3.connect(self.path())
+        try:
+            used = raw.execute(
+                "SELECT used FROM confirmations WHERE token = ?",
+                (token,),
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(used, 0)
+        retry = do_redeem(gate2, do_initial(self, gate2))
         self.assertEqual(retry["status"], "allowed")
 
     def test_journal_failure_rolls_back(self):
@@ -493,6 +520,117 @@ class CommitUncertaintyTests(GateSQLiteCase):
         with self.assertRaises(KeyboardInterrupt):
             tx.__exit__(None, None, None)
         self.assertFalse(backend._in_transaction)
+
+
+class EpochBindingTests(GateSQLiteCase):
+    """S4: a confirmation dies with the boot epoch that issued it."""
+
+    def _set_epoch(self, token, epoch):
+        raw = sqlite3.connect(self.path())
+        try:
+            raw.execute(
+                "UPDATE confirmations SET epoch = ? WHERE token = ?",
+                (epoch, token),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def test_restart_invalidates_pending_confirmation(self):
+        gate, backend = self.make_gate()
+        token = do_initial(self, gate)
+        gate2, _ = self.reopen(backend)
+        stale = do_redeem(gate2, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        self.assertEqual(gate2.ledger_snapshot(), {"alice": 10000})
+        self.assertEqual(len(gate2.journal_entries()), 0)
+        self.assertEqual(gate2.status()["daily_spent"], 0)
+
+    def test_fresh_confirmation_redeems_after_restart(self):
+        gate, backend = self.make_gate()
+        do_initial(self, gate)
+        gate2, _ = self.reopen(backend)
+        fresh = do_initial(self, gate2)
+        response = do_redeem(gate2, fresh)
+        self.assertEqual(response["status"], "allowed")
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+
+    def test_same_epoch_redeem_and_replay(self):
+        gate, _ = self.make_gate()
+        token = do_initial(self, gate)
+        self.assertEqual(do_redeem(gate, token)["status"], "allowed")
+        replay = do_redeem(gate, token)
+        self.assertEqual(replay["status"], "denied")
+        self.assertEqual(replay["reason"], "confirmation_reused")
+
+    def test_future_epoch_rejected(self):
+        gate, _ = self.make_gate()
+        token = do_initial(self, gate)
+        self._set_epoch(token, 999)
+        stale = do_redeem(gate, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        self.assertEqual(gate.ledger_snapshot(), {"alice": 10000})
+
+    def test_backdated_epoch_rejected(self):
+        gate, backend = self.make_gate()
+        gate2, _ = self.reopen(backend)
+        token = do_initial(self, gate2)
+        self._set_epoch(token, 0)
+        stale = do_redeem(gate2, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+
+    def test_negative_epoch_rejected_fail_closed(self):
+        gate, _ = self.make_gate()
+        token = do_initial(self, gate)
+        self._set_epoch(token, -1)
+        stale = do_redeem(gate, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+
+    def test_null_epoch_refused_by_schema(self):
+        gate, _ = self.make_gate()
+        token = do_initial(self, gate)
+        raw = sqlite3.connect(self.path())
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                raw.execute(
+                    "UPDATE confirmations SET epoch = NULL "
+                    "WHERE token = ?",
+                    (token,),
+                )
+        finally:
+            raw.close()
+
+    def test_failed_open_preserves_epoch_and_token(self):
+        gate, backend = self.make_gate()
+        token = do_initial(self, gate)
+        backend.close()
+        self.abort_on(
+            "g.db", "counters", "UPDATE",
+            "WHEN NEW.name = 'boot_epoch'",
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            SQLiteBackend.open(self.path())
+        raw = sqlite3.connect(self.path())
+        try:
+            epoch = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()[0]
+        finally:
+            raw.close()
+        self.assertEqual(epoch, 0)
+        self.drop_trigger("g.db")
+        gate2, _ = self.reopen(backend)
+        stale = do_redeem(gate2, token)
+        self.assertEqual(stale["status"], "denied")
+        self.assertEqual(stale["reason"], "confirmation_stale")
+        fresh = do_initial(self, gate2)
+        self.assertEqual(do_redeem(gate2, fresh)["status"], "allowed")
 
 
 if __name__ == "__main__":
