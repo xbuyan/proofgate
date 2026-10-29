@@ -125,9 +125,14 @@ absence from this ledger is not proof an external action never ran.
   response is an explicit error — nothing is ever silently unrecorded.
 - Records chain by `prev_hash`/`record_hash` over canonical bytes.
   Verification detects edits that break chain consistency, including
-  middle-record deletions and reorderings. Tail truncation cannot be
-  reliably detected without an independently preserved expected-length
-  checkpoint, which this prototype does not implement.
+  middle-record deletions and reorderings. Tail truncation — or any
+  restoration whose verified audit history ends early — is rejected
+  only when checkpoint enforcement is configured and the trusted
+  checkpoint (audit sequence plus hash) remains available and
+  unchanged; the checkpoint must be preserved independently of the
+  database and its backups. This detects nothing if an attacker can
+  replace or falsify both artifacts, and it claims no protection
+  against arbitrary host-level tampering.
 - Files exist only as read-only `export_jsonl` snapshots derived from the
   authoritative list, so two stores can never disagree. `verify_export`
   additionally detects torn trailing lines.
@@ -197,6 +202,48 @@ verification while missing committed transfers. A backup is a
 consistent snapshot, not necessarily a current one: restoring an older
 valid backup rolls back balances, operation records, and audit
 history. This facility provides no rollback protection.
+
+## Checkpoints
+
+A checkpoint is a small JSON file stored outside the database (and
+never included in its backup) recording a verified audit-chain head —
+sequence plus record hash — bound to an operator-configured
+deployment ID. It proves that the recorded audit prefix existed in
+this deployment; it proves nothing newer than the last successfully
+persisted checkpoint.
+
+An operation counts as checkpointed only when its audit evidence is at
+or below the recorded sequence. Commits do not advance the checkpoint
+automatically: checkpointing is an explicit operator step, so a
+database may legitimately extend its checkpoint.
+
+Initialization is explicit and requires an independently recorded
+expected audit head: open the database without enforcement, then call
+`backend.checkpoint(path, deployment_id=..., expected_seq=...,
+expected_hash=...)` with the sequence and hash from operator records
+kept outside the database (for example, a deployment log entry from
+the last verified checkpoint advancement). Initialization refuses
+unless the verified head matches exactly. Copying the expected values
+from the database currently under examination provides no rollback
+protection: a restored older database would simply bless itself.
+A missing checkpoint never bootstraps trust for an existing database,
+and opening never writes the checkpoint file. Never use the database
+path itself as the checkpoint destination: replacement is unconditional
+and would destroy the database. Prefer `backend.checkpoint()`, which
+refuses database-path aliases.
+
+At startup the database must match the checkpoint or verifiably
+extend it (full chain verified, checkpoint sequence/hash found in the
+chain). A checkpoint ahead of the database, a same-sequence hash
+mismatch, a deployment mismatch, or a malformed checkpoint fails
+closed. Recovery from a legitimate extension re-verifies the prior
+checkpoint in the chain before advancing the file; a newer checkpoint
+is never overwritten from an older database state.
+
+Keep the checkpoint on independent storage the database backup cannot
+overwrite, with owner-only permissions. Threat scope is database-only
+rollback: a host attacker able to rewrite both files is out of scope,
+and unkeyed hashes authenticate nothing on their own.
 
 ## Verification granularity
 

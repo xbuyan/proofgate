@@ -27,6 +27,12 @@ from .audit import (
     _verify_chain,
 )
 from .canonical import CanonicalizationError, canonicalize
+from .checkpoint import (
+    CheckpointError,
+    read_checkpoint,
+    validate_expected_head,
+    write_checkpoint,
+)
 from .confirmations import (
     REASON_INVALID,
     REASON_REUSED,
@@ -664,8 +670,19 @@ class SQLiteBackend(StorageBackend):
         return backend
 
     @classmethod
-    def open(cls, path, *, clock=None, ttl_seconds=None):
-        """Open an existing database. Refuses missing-path and foreign DBs."""
+    def open(cls, path, *, clock=None, ttl_seconds=None,
+             checkpoint_path=None, deployment_id=None):
+        """Open an existing database. Refuses missing-path and foreign DBs.
+
+        When *checkpoint_path* and *deployment_id* are given, the
+        database must also match or verifiably extend the external
+        checkpoint; an older snapshot fails closed instead of serving
+        rolled-back state. Both arguments are required together.
+        """
+        if (checkpoint_path is None) != (deployment_id is None):
+            raise ValueError(
+                "checkpoint_path and deployment_id are required together"
+            )
         if path != ":memory:" and not os.path.exists(path):
             raise FileNotFoundError(
                 "no such ProofGate database: %r" % (path,)
@@ -688,6 +705,10 @@ class SQLiteBackend(StorageBackend):
             verify_database(
                 backend._conn, SCHEMA_VERSION, _REQUIRED_TABLES
             )
+            if checkpoint_path is not None:
+                cls._enforce_checkpoint(
+                    backend, path, checkpoint_path, deployment_id
+                )
             # Verified: this open counts as one boot. Advancement is
             # last so any failure above leaves the epoch untouched.
             cls._advance_boot_epoch(backend)
@@ -695,6 +716,69 @@ class SQLiteBackend(StorageBackend):
             backend.close()
             raise
         return backend
+
+    @classmethod
+    def _enforce_checkpoint(cls, backend, path, checkpoint_path,
+                            deployment_id):
+        """Refuse a database that contradicts its external checkpoint.
+
+        Runs after chain verification, before boot-epoch advancement.
+        The comparison sees the verified state, which for pre-v3
+        databases already reflects committed schema migrations (those
+        migrations never touch audit records, so the compared head is
+        unchanged) — not necessarily the byte-identical as-found file.
+        Read-only with respect to the checkpoint: opening never writes
+        the checkpoint file.
+        """
+        try:
+            checkpoint = read_checkpoint(checkpoint_path)
+        except FileNotFoundError:
+            raise VerificationError(
+                "checkpoint_missing",
+                "no checkpoint at %r for %r: refusing to bootstrap "
+                "trust silently; open without checkpoint enforcement "
+                "and call backend.checkpoint() to initialize one"
+                % (checkpoint_path, path),
+            )
+        except CheckpointError as exc:
+            raise VerificationError(
+                "checkpoint_malformed",
+                "unusable checkpoint at %r: %s"
+                % (checkpoint_path, exc),
+            )
+        if checkpoint["deployment_id"] != deployment_id:
+            raise VerificationError(
+                "checkpoint_deployment",
+                "checkpoint at %r belongs to another deployment"
+                % (checkpoint_path,),
+            )
+        records = backend.audit.records
+        if checkpoint["audit_seq"] > records[-1]["seq"]:
+            raise VerificationError(
+                "checkpoint_ahead",
+                "checkpoint at %r is ahead of %r: possible rollback "
+                "to an older snapshot" % (checkpoint_path, path),
+            )
+        for record in records:
+            if record["seq"] == checkpoint["audit_seq"]:
+                if record["record_hash"] != checkpoint["audit_hash"]:
+                    raise VerificationError(
+                        "checkpoint_mismatch",
+                        "checkpoint at %r disagrees with %r at audit "
+                        "sequence %d" % (
+                            checkpoint_path, path,
+                            checkpoint["audit_seq"],
+                        ),
+                    )
+                break
+        else:
+            # Unreachable: verification guarantees contiguous 1..N
+            # sequences and the checkpoint holds 1 <= seq <= head.
+            raise VerificationError(
+                "checkpoint_mismatch",
+                "checkpoint sequence %d absent from %r"
+                % (checkpoint["audit_seq"], path),
+            )
 
     @classmethod
     def _read_schema_version(cls, backend, path):
@@ -1011,6 +1095,142 @@ class SQLiteBackend(StorageBackend):
                     "destination also failed: %r" % (remove_exc,)
                 )
             raise
+
+    def checkpoint(self, checkpoint_path, *, deployment_id,
+                 expected_seq=None, expected_hash=None):
+        """Persist an external audit-head checkpoint for this database.
+
+        Records the verified audit-chain head (sequence + record hash)
+        bound to the operator-configured *deployment_id*. The file must
+        live outside the database and its backups; storing it on the
+        database path or its sidecars is refused.
+
+        Advancement rules: a missing file is initialized only when the
+        caller supplies the expected audit sequence and hash from an
+        independent record and they match the verified head exactly;
+        an identical checkpoint is returned unchanged; an older
+        checkpoint advances only after the full chain re-verifies and
+        the prior checkpoint is found in it; a newer checkpoint, a
+        same-sequence hash fork, a deployment mismatch, or a malformed
+        file is refused without touching the existing file.
+        ``expected_seq``/``expected_hash`` are required to create
+        the file and refused when one already exists; advancement
+        always follows the existing file and init arguments cannot
+        bypass its checks. Committed operations
+        are never reported as checkpointed here: a checkpoint covers
+        the audit head it records, and anything newer is a verified
+        extension.
+
+        Stale-database detection at initialization holds only when the
+        expected head is genuinely independent of the database being
+        checked; copying it from that database proves nothing, and no
+        protection is claimed against falsified expected values.
+        """
+        if self._in_transaction:
+            raise SQLiteBackendError(
+                "cannot checkpoint inside a transaction"
+            )
+        if self._path is None:
+            raise SQLiteBackendError(
+                "cannot checkpoint a backend with no source path"
+            )
+        if self._path != ":memory:":
+            resolved = os.path.realpath(checkpoint_path)
+            protected = {
+                os.path.realpath(self._path + suffix)
+                for suffix in ("", "-wal", "-shm", "-journal")
+            }
+            if resolved in protected:
+                raise ValueError(
+                    "refusing to store a checkpoint on the database "
+                    "or its sidecars: %r" % (checkpoint_path,)
+                )
+        if not isinstance(deployment_id, str) or not deployment_id:
+            raise ValueError(
+                "deployment_id must be a nonempty string"
+            )
+        # The chain re-verifies read-only so the checkpoint binds a
+        # proven state, not merely the currently claimed head.
+        verify_database(
+            self._conn, SCHEMA_VERSION, _REQUIRED_TABLES
+        )
+        records = self.audit.records
+        head = records[-1]
+        try:
+            prior = read_checkpoint(checkpoint_path)
+        except FileNotFoundError:
+            prior = None
+        if prior is None:
+            # Initialization: the expected head must arrive from the
+            # caller (an independent record), never from this
+            # database. Without it, or on any mismatch, refuse
+            # without creating a file.
+            if expected_seq is None or expected_hash is None:
+                raise CheckpointError(
+                    "cannot initialize checkpoint at %r: expected "
+                    "audit sequence and hash from an independent "
+                    "record are required" % (checkpoint_path,)
+                )
+            want_seq, want_hash = validate_expected_head(
+                expected_seq, expected_hash
+            )
+            if (
+                want_seq != head["seq"]
+                or want_hash != head["record_hash"]
+            ):
+                raise CheckpointError(
+                    "cannot initialize checkpoint at %r: database "
+                    "head does not match the expected audit "
+                    "sequence/hash" % (checkpoint_path,)
+                )
+            return write_checkpoint(
+                checkpoint_path, deployment_id, head["seq"],
+                head["record_hash"],
+            )
+        if prior is not None:
+            if expected_seq is not None or expected_hash is not None:
+                raise CheckpointError(
+                    "expected audit sequence/hash apply only to "
+                    "initialization; advancement of %r follows the "
+                    "existing checkpoint" % (checkpoint_path,)
+                )
+            if prior["deployment_id"] != deployment_id:
+                raise CheckpointError(
+                    "refusing to overwrite a checkpoint belonging to "
+                    "another deployment: %r" % (checkpoint_path,)
+                )
+            if prior["audit_seq"] > head["seq"]:
+                raise CheckpointError(
+                    "refusing to overwrite a newer checkpoint at %r "
+                    "from an older database state" % (checkpoint_path,)
+                )
+            if prior["audit_seq"] == head["seq"]:
+                if prior["audit_hash"] == head["record_hash"]:
+                    return prior
+                raise CheckpointError(
+                    "refusing to advance checkpoint at %r: same audit "
+                    "sequence with a different hash"
+                    % (checkpoint_path,)
+                )
+            for record in records:
+                if record["seq"] == prior["audit_seq"]:
+                    if record["record_hash"] != prior["audit_hash"]:
+                        raise CheckpointError(
+                            "refusing to advance checkpoint at %r: "
+                            "prior checkpoint not found in the audit "
+                            "chain" % (checkpoint_path,)
+                        )
+                    break
+            else:
+                raise CheckpointError(
+                    "refusing to advance checkpoint at %r: prior "
+                    "checkpoint not found in the audit chain"
+                    % (checkpoint_path,)
+                )
+        return write_checkpoint(
+            checkpoint_path, deployment_id, head["seq"],
+            head["record_hash"],
+        )
 
     # -- transaction management --------------------------------------
 
