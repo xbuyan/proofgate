@@ -32,7 +32,11 @@ from .audit import AuditError
 from .canonical import arg_hash
 from .confirmations import ConfirmationError, ConfirmationStore
 from .policy import Policy, evaluate, validate_policy_fields
-from .sqlite_backend import SQLiteBackendError, _CommitUncertainError
+from .sqlite_backend import (
+    SQLiteBackendError,
+    _CommitUncertainError,
+    _commit_interrupt_handler,
+)
 from .storage import MemoryBackend, StorageBackend
 from .tools import (
     get_balance as read_balance,
@@ -99,16 +103,37 @@ def _with_storage_boundary(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        def mark_commit_interrupted():
+            detail = (
+                "%s: interrupted during commit; outcome uncertain"
+                % method.__name__
+            )
+            try:
+                self._set_degraded("outcome_uncertain", detail)
+            except BaseException:
+                # Preserve fail-closed state even if incident detail
+                # construction itself fails.
+                self._degraded = {
+                    "case": "outcome_uncertain",
+                    "detail": detail,
+                    "audit_records": "unknown",
+                }
+
+        token = _commit_interrupt_handler.set(mark_commit_interrupted)
         try:
-            return method(self, *args, **kwargs)
-        except _CommitUncertainError as exc:
-            reason = REASON_OUTCOME_UNCERTAIN
-            case = "outcome_uncertain"
-            detail = "%s: %s" % (method.__name__, exc)
-        except sqlite3.Error as exc:
-            reason = REASON_STORAGE_UNAVAILABLE
-            case = "storage_unavailable"
-            detail = "%s: rolled back: %s" % (method.__name__, exc)
+            try:
+                return method(self, *args, **kwargs)
+            except _CommitUncertainError as exc:
+                reason = REASON_OUTCOME_UNCERTAIN
+                case = "outcome_uncertain"
+                detail = "%s: %s" % (method.__name__, exc)
+            except sqlite3.Error as exc:
+                reason = REASON_STORAGE_UNAVAILABLE
+                case = "storage_unavailable"
+                detail = "%s: rolled back: %s" % (method.__name__, exc)
+        finally:
+            _commit_interrupt_handler.reset(token)
+
         with self._lock:
             try:
                 self._set_degraded(case, detail)

@@ -604,6 +604,108 @@ class CommitUncertaintyTests(GateSQLiteCase):
             tx.__exit__(RuntimeError, RuntimeError("body"), None)
         self.assertFalse(backend._in_transaction)
 
+    def test_interrupt_after_durable_commit_degrades_and_recovers(self):
+        gate, backend = self.make_gate()
+        key = "interrupt-after-commit-1"
+        transfer_args = args()
+
+        initial = gate.gate({
+            "action": "transfer_money",
+            "args": transfer_args,
+            "idempotency_key": key,
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+
+        real_conn = backend._conn
+
+        class CommitThenInterrupt:
+            """Simulate interruption after SQLite has committed."""
+
+            def __init__(self, conn):
+                self._conn = conn
+                self._raised = False
+
+            def commit(self):
+                self._conn.commit()
+                if not self._raised:
+                    self._raised = True
+                    raise KeyboardInterrupt()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        backend._conn = CommitThenInterrupt(real_conn)
+
+        with self.assertRaises(KeyboardInterrupt):
+            gate.gate({
+                "action": "transfer_money",
+                "args": transfer_args,
+                "confirmation": initial["confirmation"],
+                "idempotency_key": key,
+            })
+
+        # The interrupt must propagate, but uncertain state must fail closed.
+        self.assertTrue(gate.status()["degraded"])
+
+        status = gate.operation_status(
+            key, action="transfer_money", args=transfer_args
+        )
+        self.assertEqual(status["status"], "committed")
+        receipt = status["receipt"]
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+        gate2, _backend2 = self.reopen(backend)
+        recovered = gate2.operation_status(
+            key, action="transfer_money", args=transfer_args
+        )
+        self.assertEqual(recovered["status"], "committed")
+        self.assertEqual(recovered["receipt"], receipt)
+
+        retry = gate2.gate({
+            "action": "transfer_money",
+            "args": transfer_args,
+            "idempotency_key": key,
+        })
+        self.assertEqual(retry["status"], "allowed")
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["receipt"], receipt)
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate2.journal_entries()), 1)
+
+    def test_direct_commit_interrupt_leaves_no_stale_gate_signal(self):
+        gate, backend = self.make_gate()
+        real_conn = backend._conn
+
+        class CommitThenInterrupt:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def commit(self):
+                self._conn.commit()
+                raise KeyboardInterrupt()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        backend._conn = CommitThenInterrupt(real_conn)
+        with self.assertRaises(KeyboardInterrupt):
+            with backend.transaction():
+                pass
+
+        @_with_storage_boundary
+        def unrelated_interrupt(self):
+            raise KeyboardInterrupt()
+
+        with self.assertRaises(KeyboardInterrupt):
+            unrelated_interrupt(gate)
+
+        self.assertFalse(gate.status()["degraded"])
+
     def test_interrupt_during_commit_propagates(self):
         class InterruptedConn:
             def commit(self):

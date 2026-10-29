@@ -12,6 +12,7 @@ remains the default; behavior there is unchanged.
 """
 
 import copy
+from contextvars import ContextVar
 import hashlib
 import hmac
 import json
@@ -55,6 +56,11 @@ from .verify import VerificationError, verify_database
 __all__ = ["SCHEMA_VERSION", "SQLiteBackend", "SQLiteBackendError"]
 
 SCHEMA_VERSION = "3"
+
+# Scoped owner callback for uncertain commit interruptions.
+_commit_interrupt_handler = ContextVar(
+    "proofgate_commit_interrupt_handler", default=None
+)
 
 # One statement per entry (no splitting); DDL runs inside the seed
 # transaction so creation is atomic.
@@ -1489,6 +1495,19 @@ class _Transaction:
                     raise _CommitUncertainError(
                         "commit failed (%s); outcome uncertain" % (exc,)
                     ) from exc
+                except BaseException:
+                    # Commit outcome may be uncertain. Notify only the
+                    # owner scoped to this operation, then preserve the
+                    # original control-flow exception.
+                    handler = _commit_interrupt_handler.get()
+                    if handler is not None:
+                        try:
+                            handler()
+                        except BaseException:
+                            # Never replace KeyboardInterrupt/SystemExit
+                            # with an error raised while recording state.
+                            pass
+                    raise
             else:
                 try:
                     backend._conn.rollback()
