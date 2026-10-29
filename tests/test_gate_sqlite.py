@@ -200,6 +200,23 @@ class DurablePolicyTests(GateSQLiteCase):
         })
         self.assertEqual(allowed["status"], "allowed")
 
+    def test_update_policy_rejects_oversized_cap(self):
+        gate, _ = self.make_gate()
+        # Bypass Policy.create validation to reach the gate's own
+        # re-validation, as a hostile or buggy caller could.
+        oversized = Policy(
+            version="v2", per_transfer_cap=2**70, daily_cap=1000,
+            allowed_targets=("bob", "carol"),
+        )
+        result = gate.update_policy(oversized)
+        self.assertEqual(result["status"], "denied")
+        self.assertEqual(result["reason"], "invalid_policy")
+        self.assertEqual(gate.status()["policy_version"], "v1")
+        self.assertFalse(gate.status()["degraded"])
+        # Gate remains usable: a normal transfer still works.
+        token = do_initial(self, gate)
+        self.assertEqual(do_redeem(gate, token)["status"], "allowed")
+
     def test_failed_policy_update_consistent_after_reopen(self):
         gate, backend = self.make_gate()
         token = do_initial(self, gate)

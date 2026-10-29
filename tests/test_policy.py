@@ -51,6 +51,18 @@ class PolicyModelTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             make_policy(allowed_targets=b"bob")
 
+    def test_create_enforces_sqlite_integer_range(self):
+        ceiling = 2**63 - 1
+        pol = make_policy(
+            per_transfer_cap=ceiling, daily_cap=ceiling
+        )
+        self.assertEqual(pol.per_transfer_cap, ceiling)
+        self.assertEqual(pol.daily_cap, ceiling)
+        with self.assertRaises(PolicyError):
+            make_policy(per_transfer_cap=2**63)
+        with self.assertRaises(PolicyError):
+            make_policy(daily_cap=2**63)
+
 
 class PolicyEvaluateTests(unittest.TestCase):
     def setUp(self):

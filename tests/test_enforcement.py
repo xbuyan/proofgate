@@ -473,6 +473,12 @@ class LedgerJournalUnitTests(unittest.TestCase):
         with self.assertRaises(LedgerError):
             SyntheticLedger({"alice": True})
 
+    def test_seed_enforces_sqlite_integer_range(self):
+        ledger = SyntheticLedger({"alice": 2**63 - 1})
+        self.assertEqual(ledger.balance("alice"), 2**63 - 1)
+        with self.assertRaises(LedgerError):
+            SyntheticLedger({"alice": 2**63})
+
     def test_journal_sequence_and_snapshot(self):
         journal = Journal()
         first = journal.append_transfer("alice", "bob", 10)

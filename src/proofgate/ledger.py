@@ -8,6 +8,8 @@ only by the enforcement module. Unknown accounts read as balance zero.
 the start of every mutation and may raise to simulate a ledger failure.
 """
 
+from .canonical import SQLITE_INTEGER_MAX
+
 __all__ = ["LedgerError", "SyntheticLedger"]
 
 
@@ -28,9 +30,11 @@ class SyntheticLedger:
                 isinstance(amount, bool)
                 or not isinstance(amount, int)
                 or amount < 0
+                or amount > SQLITE_INTEGER_MAX
             ):
                 raise LedgerError(
-                    "balances must be non-negative ints: %r" % (account,)
+                    "balances must be non-negative ints storable "
+                    "in SQLite (at most 2**63 - 1): %r" % (account,)
                 )
         self._balances = dict(balances)
         self.fault_hook = None

@@ -217,6 +217,7 @@ class SchemaTests(SQLiteCase):
             ({"policy": bad_policy}, PolicyError),
             ({"balances": {"alice": -1}}, LedgerError),
             ({"balances": {"alice": 1.5}}, LedgerError),
+            ({"balances": {"alice": 2**63}}, LedgerError),
             ({"ttl_seconds": float("inf")}, ValueError),
             ({"ttl_seconds": float("nan")}, ValueError),
             ({"prior_export_hash": 123}, TypeError),

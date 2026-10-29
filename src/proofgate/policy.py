@@ -13,6 +13,8 @@ rollover is explicitly out of scope for this prototype.
 
 from dataclasses import dataclass
 
+from .canonical import SQLITE_INTEGER_MAX
+
 __all__ = [
     "Policy",
     "PolicyError",
@@ -54,8 +56,15 @@ def validate_policy_fields(*, version, per_transfer_cap, daily_cap,
         raise PolicyError("version must be a non-empty string")
     for name, cap in (("per_transfer_cap", per_transfer_cap),
                       ("daily_cap", daily_cap)):
-        if not _is_int(cap) or cap < 0:
-            raise PolicyError("%s must be a non-negative int" % name)
+        if (
+            not _is_int(cap)
+            or cap < 0
+            or cap > SQLITE_INTEGER_MAX
+        ):
+            raise PolicyError(
+                "%s must be a non-negative int storable in "
+                "SQLite (at most 2**63 - 1)" % name
+            )
     if isinstance(allowed_targets, (str, bytes)):
         raise PolicyError(
             "allowed_targets must be a collection of strings, "

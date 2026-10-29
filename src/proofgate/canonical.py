@@ -9,7 +9,19 @@ are rejected here as defense in depth.
 import hashlib
 import json
 
-__all__ = ["CanonicalizationError", "arg_hash", "canonicalize"]
+__all__ = [
+    "CanonicalizationError",
+    "SQLITE_INTEGER_MAX",
+    "arg_hash",
+    "canonicalize",
+]
+
+
+#: Maximum SQLite INTEGER value (signed 64-bit). Policy caps and
+#: ledger balances must not exceed it: larger values cannot be bound
+#: to SQLite storage, so domain validation rejects them fail-fast
+#: instead of leaking OverflowError from the driver.
+SQLITE_INTEGER_MAX = 2**63 - 1
 
 
 class CanonicalizationError(TypeError):
