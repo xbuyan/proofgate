@@ -743,5 +743,112 @@ class BackupDurabilityTests(GateSQLiteCase):
         )
 
 
+class RecoveryJourneyTests(GateSQLiteCase):
+    """B2-E4: fault -> degraded -> query -> reset -> retry, exactly once.
+
+    A keyed transfer fails mid-redemption on a real SQLite backend,
+    rolls back, and degrades the gate. The caller resolves the truth
+    via ``operation_status`` while degraded, recovers with
+    ``operator_reset``, and resumes with the same key: the transfer
+    executes exactly once and the stored receipt answers retries.
+    """
+
+    def keyed_initial(self, testcase, gate, key, **kwargs):
+        params = {"amount": 100, "target": "bob"}
+        params.update(kwargs)
+        response = gate.gate({
+            "action": "transfer_money", "args": args(**params),
+            "idempotency_key": key,
+        })
+        testcase.assertEqual(
+            response["status"], "confirmation_required"
+        )
+        return response["confirmation"]
+
+    def test_storage_fault_recovery_executes_once(self):
+        gate, _ = self.make_gate()
+        key = "rec-1"
+        token1 = self.keyed_initial(self, gate, key)
+
+        # Deterministic statement fault late in redemption: the
+        # journal INSERT aborts, so the whole transaction — consume,
+        # AUTHORIZED record, counters — must roll back.
+        self.abort_on("g.db", "journal", "INSERT")
+        failed = gate.gate({
+            "action": "transfer_money", "args": args(),
+            "confirmation": token1, "idempotency_key": key,
+        })
+        # Error, not success and not a definite denial. (True
+        # outcome_uncertain needs commit/rollback failure, which no
+        # real backend can produce deterministically; that path stays
+        # stub-tested. This journey covers the realizable fault.)
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["reason"], "storage_unavailable")
+        status = gate.status()
+        self.assertTrue(status["degraded"])
+        self.assertEqual(
+            status["incident"]["case"], "storage_unavailable"
+        )
+        self.assertEqual(gate.ledger_snapshot(), {"alice": 10000})
+        self.assertEqual(len(gate.journal_entries()), 0)
+        self.assertEqual(gate.status()["daily_spent"], 0)
+
+        # Truthful status while degraded; the query mutates nothing.
+        audit_before = len(gate.audit_records())
+        journal_before = len(gate.journal_entries())
+        pending = gate.operation_status(key)
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(len(gate.audit_records()), audit_before)
+        self.assertEqual(len(gate.journal_entries()), journal_before)
+
+        # Recover: remove the fault, then reset. Reset requires clean
+        # reconciliation (true: everything rolled back) and clears
+        # all confirmation tokens, so a fresh token is required next.
+        self.drop_trigger("g.db")
+        reset = gate.operator_reset()
+        self.assertEqual(reset["status"], "reset")
+        self.assertFalse(gate.status()["degraded"])
+
+        # Resume the same logical operation: pending record found, new
+        # token issued, single execution with a committed receipt.
+        token2 = self.keyed_initial(self, gate, key)
+        self.assertNotEqual(token2, token1)
+        redeemed = gate.gate({
+            "action": "transfer_money", "args": args(),
+            "confirmation": token2, "idempotency_key": key,
+        })
+        self.assertEqual(redeemed["status"], "allowed")
+        self.assertEqual(redeemed["receipt"]["journal_seq"], 1)
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate.journal_entries()), 1)
+        committed = gate.operation_status(key)
+        self.assertEqual(committed["status"], "committed")
+        self.assertEqual(committed["receipt"], redeemed["receipt"])
+
+        # Retry answers from the stored receipt: no second mutation.
+        retry = gate.gate({
+            "action": "transfer_money", "args": args(),
+            "idempotency_key": key,
+        })
+        self.assertEqual(retry["status"], "allowed")
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["receipt"], redeemed["receipt"])
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+        # Evidence audit: the failed attempt left no partial records
+        # behind (no authorized/outcome from attempt one); the trailing
+        # decision is the duplicate-return marker for the retry.
+        self.assertEqual(
+            kinds(gate),
+            ["genesis", "decision", "degraded_cleared", "decision",
+             "authorized", "outcome", "decision"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

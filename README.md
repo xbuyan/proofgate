@@ -109,7 +109,9 @@ executing. `operation_status(key)` reports `committed` (with receipt),
 `pending`, `not_found`, or `conflict`; `not_found` means no record in
 this database, never proof of non-execution elsewhere. Operation
 records survive `operator_reset` and restarts; confirmation expiry and
-epoch rules still govern every token. Keys are bearer identifiers:
+epoch rules still govern every token. Reopening a database advances
+its boot epoch, which invalidates every confirmation token issued
+before the restart. Keys are bearer identifiers:
 whoever presents one may query or retry its operation — cross-principal
 isolation is out of scope.
 
@@ -148,7 +150,7 @@ absence from this ledger is not proof an external action never ran.
 
 ## Failure outcomes
 
-Three outcomes cover every failure, distinguished so callers can reason:
+The following outcomes distinguish the main failure cases:
 
 - `error` / `audit_unavailable` — recording failed before any mutation.
   Nothing executed, the confirmation was not consumed, degraded mode is set.
@@ -162,6 +164,15 @@ Three outcomes cover every failure, distinguished so callers can reason:
   but the OUTCOME record could not be written. The response names what
   executed (source, target, amount, journal sequence) and degraded mode is
   set. It is never reported as denied.
+- `error` / `storage_unavailable` — a storage statement failed and the
+  backend observed its rollback succeed. Nothing in the attempt
+  committed, the gate is degraded, and no audit evidence is fabricated
+  for the rolled-back attempt. This is the known-rollback case only,
+  not a blanket claim about every storage error.
+- `error` / `outcome_uncertain` — commit failed, or rollback itself
+  failed, so the transaction outcome cannot be established. The gate
+  is degraded. Treat this as neither success nor denial; resolve it
+  through `operation_status` (see Caller recovery).
 
 A potentially executed operation is never reported as `denied`, because a
 denial asserts nothing ran. Blurring that line would let callers retry or
@@ -183,6 +194,54 @@ operator-supplied forensic reference string recorded verbatim in its
 genesis record. It authenticates nothing, proves no continuity or chain of
 custody, and the new instance performs no lookup or validation of the old
 bytes. Deliberately, no `prior_verified` field exists.
+
+## Caller recovery
+
+- `denied` — that attempt did not execute. Correct the request and
+  submit a new attempt, or abandon it. A denial is returned only
+  before any mutation, so it never needs uncertainty handling.
+- `allowed` with a receipt — the transfer committed. If
+  `duplicate: true`, the receipt is the stored original rather than a
+  new execution; use it and stop.
+- `error` / `storage_unavailable` — the attempt rolled back and
+  nothing committed. Query `operation_status`, then reset or reopen
+  before any further transfer.
+- `error` / `outcome_uncertain` — commit status is unknown. Assume
+  neither success nor failure. Query
+  `operation_status(key, action, args)` with the same key, action, and
+  arguments; a fingerprint mismatch is reported as `conflict`.
+- Status `committed` — use the stored receipt; do not execute again.
+- Status `pending` — the operation is recorded but not committed.
+  After reset or reopen, resume with the same key and a fresh
+  confirmation. Recovery is safe because of the durable pending
+  record plus verified storage state, not because of the new token
+  alone.
+- Status `not_found` — no matching record exists in the currently
+  verified database. This is not proof the operation never executed:
+  restoring an older backup erases operation records along with
+  everything else.
+- Status `error` (including `operation_unverifiable`) — stop and
+  escalate. Never reinterpret an error as `not_found`, and do not
+  retry while the underlying cause remains unresolved. The current
+  status cannot establish a trustworthy outcome; resolve the storage
+  or integrity problem before querying again or considering further
+  action.
+- Degraded mode — every `transfer_money` call is refused with `error`
+  / `degraded`, including retries that would otherwise return a
+  stored duplicate receipt. Recover with `operator_reset()`, which
+  requires clean reconciliation, cross-checks, and audit
+  verification and clears all confirmation tokens — or reopen, which
+  starts an undegraded instance only if startup verification passes.
+  Never force reset through a refusal; divergence residue requires
+  reconstruction instead.
+- Restart — reopening advances the boot epoch, so every pre-restart
+  confirmation token is stale. Always obtain a fresh confirmation
+  after reopen and never reuse an old token; the same idempotency
+  key still deduplicates or resumes across the restart.
+- Keyless operations — without a key there is no durable operation
+  record, so a keyless retry after an uncertain outcome is a new
+  operation that may execute twice. Prefer keys for any transfer the
+  caller might retry.
 
 ## Backup
 
