@@ -179,6 +179,25 @@ genesis record. It authenticates nothing, proves no continuity or chain of
 custody, and the new instance performs no lookup or validation of the old
 bytes. Deliberately, no `prior_verified` field exists.
 
+## Backup
+
+An open SQLite database is backed up with `backend.backup(dest)`,
+which uses the SQLite backup API (`sqlite3.Connection.backup()`): the
+snapshot reflects committed state while the source stays open and
+usable, and the destination is verified before success is reported.
+The source is never mutated, closed, or advanced by a backup.
+
+Example (synthetic paths):
+
+    backend.backup("/var/backups/proofgate/g-2026-10-29.db")
+
+Copying only the main `.db` file while WAL is active is unsupported
+and unsafe: uncheckpointed frames live in `-wal`, so the copy can pass
+verification while missing committed transfers. A backup is a
+consistent snapshot, not necessarily a current one: restoring an older
+valid backup rolls back balances, operation records, and audit
+history. This facility provides no rollback protection.
+
 ## Verification granularity
 
 Each append re-verifies the previous record's hash link (O(1)). The full

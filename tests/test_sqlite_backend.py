@@ -29,6 +29,7 @@ from proofgate.confirmations import (
 from proofgate.ledger import LedgerError
 from proofgate.ledger import _Mutator as LedgerMutator
 from proofgate.policy import Policy, PolicyError
+from proofgate import sqlite_backend
 from proofgate.sqlite_backend import (
     SCHEMA_VERSION,
     SQLiteBackend,
@@ -1468,6 +1469,286 @@ class ContractParityTests(SQLiteCase):
             )
         backend = self.create(name="ttl-ok.db", ttl_seconds=10 ** 9)
         self.assertEqual(backend._ttl, 10 ** 9)
+
+
+class BackupTests(SQLiteCase):
+    def epoch_of(self, name="g.db"):
+        conn = sqlite3.connect(
+            "file:%s?mode=ro" % self.path(name), uri=True
+        )
+        try:
+            return conn.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_backup_copies_open_database(self):
+        backend = self.create()
+        # Seed writes are uncheckpointed while the source stays open:
+        # exactly the state a main-file copy would silently truncate.
+        self.assertTrue(os.path.exists(self.path() + "-wal"))
+        backend.backup(self.path("copy.db"))
+        # The copy is a pure snapshot: same epoch, no boot record yet.
+        self.assertEqual(self.epoch_of("copy.db"), 0)
+        copy = SQLiteBackend.open(self.path("copy.db"))
+        self._backends.append(copy)
+        self.assertEqual(copy.ledger.snapshot(), {"alice": 10000})
+        self.assertEqual(len(copy.audit), len(backend.audit) + 1)
+        self.assertEqual(copy.audit.records[-1]["kind"], "boot")
+        self.assertEqual(self.epoch_of("copy.db"), 1)
+
+    def test_backup_leaves_source_unchanged(self):
+        backend = self.create()
+        before = (
+            backend.ledger.snapshot(), len(backend.audit),
+            self.epoch_of(),
+        )
+        backend.backup(self.path("copy.db"))
+        self.assertEqual(
+            (
+                backend.ledger.snapshot(), len(backend.audit),
+                self.epoch_of(),
+            ),
+            before,
+        )
+        # The source WAL is intact: backup checkpoints nothing away.
+        self.assertTrue(os.path.exists(self.path() + "-wal"))
+
+    def test_backup_destination_has_no_sidecars(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        backend.backup(dest)
+        for suffix in ("-wal", "-shm", "-journal"):
+            self.assertFalse(os.path.exists(dest + suffix))
+
+    def test_backup_refuses_existing_destination(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        with open(dest, "wb") as handle:
+            handle.write(b"sentinel")
+        with self.assertRaises(FileExistsError):
+            backend.backup(dest)
+        with open(dest, "rb") as handle:
+            self.assertEqual(handle.read(), b"sentinel")
+
+    @unittest.skipUnless(
+        hasattr(os, "umask"), "POSIX umask required"
+    )
+    def test_backup_existing_destination_keeps_permissions(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        with open(dest, "wb") as handle:
+            handle.write(b"sentinel")
+        os.chmod(dest, 0o644)
+        with self.assertRaises(FileExistsError):
+            backend.backup(dest)
+        with open(dest, "rb") as handle:
+            self.assertEqual(handle.read(), b"sentinel")
+        self.assertEqual(os.stat(dest).st_mode & 0o777, 0o644)
+
+    def test_backup_refuses_source_alias(self):
+        backend = self.create()
+        with self.assertRaises(ValueError):
+            backend.backup(self.path())
+        # Same file under a different spelling resolves identically.
+        alias = os.path.join(self.tmp.name, ".", "g.db")
+        with self.assertRaises(ValueError):
+            backend.backup(alias)
+
+    @unittest.skipUnless(
+        hasattr(os, "symlink"), "symlinks required"
+    )
+    def test_backup_refuses_symlink_alias(self):
+        backend = self.create()
+        link = self.path("link.db")
+        os.symlink(self.path(), link)
+        with self.assertRaises(ValueError):
+            backend.backup(link)
+
+    def test_backup_refuses_memory_destination(self):
+        backend = self.create()
+        before = set(os.listdir(self.tmp.name))
+        with self.assertRaises(ValueError):
+            backend.backup(":memory:")
+        self.assertEqual(set(os.listdir(self.tmp.name)), before)
+
+    def test_backup_refuses_inside_transaction(self):
+        backend = self.create()
+        before = set(os.listdir(self.tmp.name))
+        with backend.transaction():
+            with self.assertRaises(SQLiteBackendError):
+                backend.backup(self.path("copy.db"))
+        self.assertEqual(set(os.listdir(self.tmp.name)), before)
+
+    def test_backup_failure_removes_only_owned_files(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        strays = [
+            dest + "-wal", dest + "-shm", dest + "-journal",
+        ]
+        for stray in strays:
+            with open(stray, "wb") as handle:
+                handle.write(b"stray")
+        # Closed source: the backup step itself must fail.
+        backend.close()
+        with self.assertRaises(SQLiteBackendError):
+            backend.backup(dest)
+        self.assertFalse(os.path.exists(dest))
+        for stray in strays:
+            with open(stray, "rb") as handle:
+                self.assertEqual(handle.read(), b"stray")
+        self.assertTrue(os.path.exists(self.path()))
+
+    def test_backup_cleanup_unlinks_only_destination(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        # Closed source: the backup step itself must fail.
+        backend.close()
+        removed = []
+        real_remove = os.remove
+
+        def tracking_remove(path):
+            removed.append(path)
+            return real_remove(path)
+
+        # Process-global shim, restored like the umask tests: the only
+        # deterministic way to pin which paths cleanup unlinks. The
+        # previous snapshot-based cleanup attempted four removals here.
+        os.remove = tracking_remove
+        try:
+            with self.assertRaises(SQLiteBackendError):
+                backend.backup(dest)
+        finally:
+            os.remove = real_remove
+        self.assertEqual(removed, [dest])
+
+    def test_backup_remove_failure_noted_on_original(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        # Closed source: the backup step itself must fail first.
+        backend.close()
+        real_remove = os.remove
+
+        def failing_remove(path):
+            raise OSError("injected remove failure")
+
+        os.remove = failing_remove
+        try:
+            with self.assertRaises(SQLiteBackendError) as raised:
+                backend.backup(dest)
+        finally:
+            os.remove = real_remove
+        # The original failure is preserved, not masked.
+        self.assertIn("backup to", str(raised.exception))
+        notes = getattr(raised.exception, "__notes__", ())
+        self.assertTrue(
+            any("removing the reserved destination" in note
+                for note in notes),
+            notes,
+        )
+        self.assertTrue(os.path.exists(dest))
+
+    def test_backup_close_failure_removes_destination(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        real_close_target = sqlite_backend._close_target
+
+        def failing_close(target):
+            target.close()
+            raise sqlite3.OperationalError("injected close failure")
+
+        sqlite_backend._close_target = failing_close
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                backend.backup(dest)
+        finally:
+            sqlite_backend._close_target = real_close_target
+        # The close error is primary, and the reservation is removed:
+        # a failed close is backup failure, not success.
+        self.assertIn("injected close failure", str(raised.exception))
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(dest + "-journal"))
+        # The source is untouched by the failed backup.
+        self.assertEqual(backend.ledger.snapshot(), {"alice": 10000})
+
+    def test_backup_cleanup_close_failure_noted(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        # Closed source: the backup step itself must fail first.
+        backend.close()
+        real_close_target = sqlite_backend._close_target
+
+        def failing_close(target):
+            target.close()
+            raise sqlite3.OperationalError("injected close failure")
+
+        sqlite_backend._close_target = failing_close
+        try:
+            with self.assertRaises(SQLiteBackendError) as raised:
+                backend.backup(dest)
+        finally:
+            sqlite_backend._close_target = real_close_target
+        # Original failure preserved; close failure attached as a note.
+        self.assertIn("backup to", str(raised.exception))
+        notes = getattr(raised.exception, "__notes__", ())
+        self.assertTrue(
+            any("closing the destination connection" in note
+                for note in notes),
+            notes,
+        )
+        # Removal is still attempted despite the close failure.
+        self.assertFalse(os.path.exists(dest))
+
+    def test_backup_reservation_close_failure_cleans_up(self):
+        backend = self.create()
+        dest = self.path("copy.db")
+        real_close = os.close
+        calls = []
+
+        def failing_close(fd):
+            calls.append(fd)
+            real_close(fd)
+            raise OSError("injected reservation close failure")
+
+        os.close = failing_close
+        try:
+            with self.assertRaises(OSError) as raised:
+                backend.backup(dest)
+        finally:
+            os.close = real_close
+        # The original close error is primary.
+        self.assertIn("injected reservation close failure",
+                      str(raised.exception))
+        self.assertEqual(len(calls), 1)
+        # The reservation is removed despite the close failure.
+        self.assertFalse(os.path.exists(dest))
+        # The source is untouched by the failed backup.
+        self.assertEqual(backend.ledger.snapshot(), {"alice": 10000})
+
+    @unittest.skipUnless(
+        hasattr(os, "umask"), "POSIX umask required"
+    )
+    def test_backup_restricts_destination_permissions(self):
+        backend = self.create()
+        previous = os.umask(0o000)
+        try:
+            backend.backup(self.path("copy.db"))
+            mode = os.stat(self.path("copy.db")).st_mode & 0o777
+        finally:
+            os.umask(previous)
+        self.assertEqual(mode, 0o600)
+
+    def test_backup_from_memory_source(self):
+        backend = SQLiteBackend.create(
+            ":memory:", policy=make_policy(),
+            balances={"alice": 10000},
+        )
+        self._backends.append(backend)
+        backend.backup(self.path("copy.db"))
+        copy = SQLiteBackend.open(self.path("copy.db"))
+        self._backends.append(copy)
+        self.assertEqual(copy.ledger.snapshot(), {"alice": 10000})
 
 
 if __name__ == "__main__":

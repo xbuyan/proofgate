@@ -527,11 +527,23 @@ class _SQLiteConfirmations:
         return row["n"]
 
 
+def _close_target(target):
+    """Close a backup destination connection.
+
+    Narrow seam so tests can inject a deterministic close failure: a
+    real close failure is otherwise uninducible without threads.
+    Production behavior is exactly ``Connection.close()``.
+    """
+    target.close()
+
+
 class SQLiteBackend(StorageBackend):
     """SQLite-backed storage (isolated slice; see module docstring)."""
 
-    def __init__(self, conn, *, clock=None, ttl_seconds=None):
+    def __init__(self, conn, *, clock=None, ttl_seconds=None,
+                 path=None):
         self._conn = conn
+        self._path = path
         self._clock = clock
         self._ttl = _checked_ttl(ttl_seconds)
         self._latest = float("-inf")
@@ -877,7 +889,8 @@ class SQLiteBackend(StorageBackend):
                 "not a ProofGate database: %r" % (path,)
             ) from exc
         try:
-            return cls(conn, clock=clock, ttl_seconds=ttl_seconds)
+            return cls(conn, clock=clock, ttl_seconds=ttl_seconds,
+                       path=path)
         except BaseException:
             conn.close()
             raise
@@ -885,6 +898,119 @@ class SQLiteBackend(StorageBackend):
     def close(self):
         """Close the connection. Idempotent."""
         self._conn.close()
+
+    def backup(self, dest_path):
+        """Copy this database to *dest_path* via the SQLite backup API.
+
+        Uses ``Connection.backup()`` so the snapshot reflects committed
+        state even while this backend stays open in WAL mode; copying
+        the main ``.db`` file instead would silently drop uncheckpointed
+        frames. The source is never mutated, closed, or advanced: no
+        epoch change, no audit event. The destination is verified with
+        the startup verifier before success is reported.
+
+        Refuses existing destinations, ``':memory:'`` destinations,
+        and source/destination aliasing. Refuses to run inside a
+        backend transaction, where uncommitted writes would be silently
+        excluded from the snapshot. On failure only the reserved
+        destination file is removed: it is the one path this call
+        provably owns. Sidecars are never deleted, since absence from
+        an earlier check cannot prove ownership; the destination
+        connection runs in rollback-journal mode, so close() already
+        removes any journal it created. A close failure during cleanup
+        is attached to the original error as a note, never masking it.
+        A failure to close the verified destination is treated as
+        backup failure instead: the close error propagates and the
+        reserved file is removed. Any sidecars left behind by a failed
+        close are never deleted — their ownership cannot be
+        established — and are inert without the destination file.
+
+        A backup is a consistent snapshot, not necessarily a current
+        one: restoring an older valid backup rolls state back, and no
+        rollback protection is claimed.
+        """
+        if self._in_transaction:
+            raise SQLiteBackendError(
+                "cannot back up inside a transaction"
+            )
+        if self._path is None:
+            raise SQLiteBackendError(
+                "cannot back up a backend with no source path"
+            )
+        if dest_path == ":memory:":
+            raise ValueError("cannot back up to ':memory:'")
+        if self._path != ":memory:" and os.path.realpath(
+            dest_path
+        ) == os.path.realpath(self._path):
+            raise ValueError(
+                "refusing to back up onto the source database: %r"
+                % (dest_path,)
+            )
+        if os.path.exists(dest_path):
+            # Fast path only (also covers existing directories); the
+            # O_EXCL reservation below is the race-safe arbiter.
+            raise FileExistsError(
+                "refusing to back up over existing path: %r"
+                % (dest_path,)
+            )
+        try:
+            # Owner-only, like create(): the database holds
+            # confirmation bearer tokens. The mode is masked by, never
+            # widened beyond, the process umask.
+            fd = os.open(
+                dest_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except FileExistsError:
+            raise FileExistsError(
+                "refusing to back up over existing path: %r"
+                % (dest_path,)
+            )
+        target = None
+        try:
+            # Releasing the reservation descriptor is part of the
+            # guarded operation: a failure here follows the same
+            # cleanup path as any later backup failure.
+            os.close(fd)
+            try:
+                target = sqlite3.connect(dest_path)
+                self._conn.backup(target)
+            except sqlite3.Error as exc:
+                raise SQLiteBackendError(
+                    "backup to %r failed" % (dest_path,)
+                ) from exc
+            verify_database(target, SCHEMA_VERSION, _REQUIRED_TABLES)
+            # Clear first: if the close below fails, the handler must
+            # treat it as backup failure (remove the reservation, keep
+            # the close error primary) without closing twice.
+            closer = target
+            target = None
+            _close_target(closer)
+        except BaseException as original:
+            # Cleanup must neither mask the original failure nor skip
+            # the removal below: a close error is noted on the
+            # original exception, never raised in its place.
+            if target is not None:
+                try:
+                    _close_target(target)
+                except Exception as close_exc:
+                    original.add_note(
+                        "backup cleanup: closing the destination "
+                        "connection also failed: %r" % (close_exc,)
+                    )
+            # Ownership-safe: the reserved file is provably ours via
+            # O_EXCL above, and it is the only path unlinked here.
+            # Sidecars are never deleted — absence from any earlier
+            # check cannot prove another process did not create one
+            # since. Our own transient journal, if the failed backup
+            # created one, is already gone with the rolled-back close.
+            try:
+                os.remove(dest_path)
+            except OSError as remove_exc:
+                original.add_note(
+                    "backup cleanup: removing the reserved "
+                    "destination also failed: %r" % (remove_exc,)
+                )
+            raise
 
     # -- transaction management --------------------------------------
 

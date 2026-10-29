@@ -650,5 +650,98 @@ class EpochBindingTests(GateSQLiteCase):
         self.assertEqual(do_redeem(gate2, fresh)["status"], "allowed")
 
 
+class BackupDurabilityTests(GateSQLiteCase):
+    """B1: a backup taken while open captures committed transfers."""
+
+    def _keyed_transfer(self, testcase, gate, key):
+        initial = gate.gate({
+            "action": "transfer_money",
+            "args": args(),
+            "idempotency_key": key,
+        })
+        testcase.assertEqual(initial["status"], "confirmation_required")
+        redeemed = gate.gate({
+            "action": "transfer_money",
+            "args": args(),
+            "confirmation": initial["confirmation"],
+            "idempotency_key": key,
+        })
+        testcase.assertEqual(redeemed["status"], "allowed")
+        return redeemed
+
+    def test_backup_captures_committed_keyed_transfer(self):
+        gate, backend = self.make_gate()
+        receipt = self._keyed_transfer(
+            self, gate, "backup-1"
+        )["receipt"]
+        backend.backup(self.path("copy.db"))
+        copy_backend = SQLiteBackend.open(self.path("copy.db"))
+        self._backends.append(copy_backend)
+        copy_gate = Gate(
+            policy=copy_backend.get_policy(), storage=copy_backend
+        )
+        # Independent verification through the normal startup path
+        # already ran inside open(); the copy carries the transfer.
+        self.assertEqual(
+            copy_gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        status = copy_gate.operation_status("backup-1")
+        self.assertEqual(status["status"], "committed")
+        self.assertEqual(status["receipt"], receipt)
+        self.assertEqual(
+            copy_gate.journal_entries(), gate.journal_entries()
+        )
+        # Opening the copy is one boot of the copy: exactly one boot
+        # record beyond the snapshotted chain, while the source chain
+        # is untouched by both the backup and the copy's open.
+        self.assertEqual(
+            len(copy_gate.audit_records()),
+            len(gate.audit_records()) + 1,
+        )
+        self.assertEqual(copy_gate.audit_records()[-1]["kind"], "boot")
+
+    def test_backup_source_stays_usable_and_unchanged(self):
+        gate, backend = self.make_gate()
+        self._keyed_transfer(self, gate, "backup-1")
+        before = (
+            gate.ledger_snapshot(), gate.journal_entries(),
+            len(gate.audit_records()),
+        )
+        backend.backup(self.path("copy.db"))
+        self.assertEqual(
+            (
+                gate.ledger_snapshot(), gate.journal_entries(),
+                len(gate.audit_records()),
+            ),
+            before,
+        )
+        # The source keeps serving after the backup.
+        receipt = self._keyed_transfer(
+            self, gate, "backup-2"
+        )["receipt"]
+        self.assertEqual(receipt["journal_seq"], 2)
+        self.assertEqual(
+            gate.operation_status("backup-1")["status"], "committed"
+        )
+
+    def test_backup_is_a_snapshot_not_a_link(self):
+        gate, backend = self.make_gate()
+        self._keyed_transfer(self, gate, "backup-1")
+        backend.backup(self.path("copy.db"))
+        self._keyed_transfer(self, gate, "backup-2")
+        copy_backend = SQLiteBackend.open(self.path("copy.db"))
+        self._backends.append(copy_backend)
+        copy_gate = Gate(
+            policy=copy_backend.get_policy(), storage=copy_backend
+        )
+        self.assertEqual(
+            copy_gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(
+            copy_gate.operation_status("backup-2")["status"],
+            "not_found",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
