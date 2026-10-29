@@ -509,6 +509,88 @@ class CommitUncertaintyTests(GateSQLiteCase):
         self.assertEqual(calls, {"commit": 1, "rollback": 1})
         self.assertFalse(backend._in_transaction)
 
+    def test_commit_acknowledgment_lost_recovers_committed_transfer(self):
+        gate, backend = self.make_gate()
+        key = "ambiguous-commit-1"
+
+        initial = gate.gate({
+            "action": "transfer_money",
+            "args": args(),
+            "idempotency_key": key,
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+
+        real_conn = backend._conn
+
+        class CommitThenRaise:
+            """Simulate a lost acknowledgment after durable commit."""
+
+            def __init__(self, conn):
+                self._conn = conn
+                self._raised = False
+
+            def commit(self):
+                self._conn.commit()
+                if not self._raised:
+                    self._raised = True
+                    raise sqlite3.OperationalError(
+                        "simulated lost commit acknowledgment"
+                    )
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        backend._conn = CommitThenRaise(real_conn)
+
+        failed = gate.gate({
+            "action": "transfer_money",
+            "args": args(),
+            "confirmation": initial["confirmation"],
+            "idempotency_key": key,
+        })
+
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["reason"], "outcome_uncertain")
+        self.assertTrue(gate.status()["degraded"])
+
+        # The underlying commit succeeded before its acknowledgment failed.
+        status = gate.operation_status(
+            key, action="transfer_money", args=args()
+        )
+        self.assertEqual(status["status"], "committed")
+        receipt = status["receipt"]
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate.journal_entries()), 1)
+
+        # Reopen through the normal startup verification path.
+        gate2, _backend2 = self.reopen(backend)
+
+        recovered = gate2.operation_status(
+            key, action="transfer_money", args=args()
+        )
+        self.assertEqual(recovered["status"], "committed")
+        self.assertEqual(recovered["receipt"], receipt)
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate2.journal_entries()), 1)
+
+        # Retrying with the same key returns the receipt without re-execution.
+        retry = gate2.gate({
+            "action": "transfer_money",
+            "args": args(),
+            "idempotency_key": key,
+        })
+        self.assertEqual(retry["status"], "allowed")
+        self.assertTrue(retry["duplicate"])
+        self.assertEqual(retry["receipt"], receipt)
+        self.assertEqual(
+            gate2.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+        self.assertEqual(len(gate2.journal_entries()), 1)
+
     def test_rollback_failure_marked_uncertain(self):
         class BrokenConn:
             def rollback(self):
