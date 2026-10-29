@@ -6,6 +6,7 @@ claims are out of scope: nothing here touches ``Gate``.
 """
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import unittest
@@ -207,6 +208,36 @@ class SchemaTests(SQLiteCase):
             self.assertEqual(handle.read(), b"junk")
         self.assertEqual(os.stat(path).st_mode & 0o777, original_mode)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)
+
+    @unittest.skipUnless(
+        hasattr(os, "umask"), "POSIX umask required"
+    )
+    def test_sidecars_grant_no_group_or_other_access(self):
+        previous = os.umask(0o000)
+        try:
+            backend = self.create()
+            try:
+                # A real write transaction reliably materializes
+                # both sidecars: WAL takes the frames, SHM takes
+                # the wal-index.
+                with backend.transaction():
+                    SQLiteMutator(backend.ledger).apply_transfer(
+                        "alice", "bob", 10
+                    )
+                wal = self.path() + "-wal"
+                shm = self.path() + "-shm"
+                self.assertTrue(os.path.exists(wal))
+                self.assertTrue(os.path.exists(shm))
+                for victim in (self.path(), wal, shm):
+                    mode = stat.S_IMODE(os.stat(victim).st_mode)
+                    self.assertEqual(mode & 0o077, 0)
+            finally:
+                backend.close()
+        finally:
+            os.umask(previous)
+        # Clean close checkpoints and unlinks the sidecars.
+        self.assertFalse(os.path.exists(self.path() + "-wal"))
+        self.assertFalse(os.path.exists(self.path() + "-shm"))
 
     def test_create_validates_before_touching_filesystem(self):
         bad_policy = SimpleNamespace(
