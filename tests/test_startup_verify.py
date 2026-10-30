@@ -15,6 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
+from proofgate.canonical import arg_hash
 from proofgate.enforcement import Gate
 from proofgate.policy import Policy
 from proofgate.sqlite_backend import (
@@ -610,6 +611,375 @@ class ConsistencyTests(VerifyCase):
         backend = SQLiteBackend.open(self.path())
         self._backends.append(backend)
         self.assertEqual(backend.get_policy().version, "v1")
+
+
+class KeyingStartupTests(VerifyCase):
+    """Slice B Phase 3: keying invariants enforced at startup."""
+
+    ARGS = {"source": "alice", "target": "bob", "amount": 100}
+
+    def gate_pair(self, name="g.db"):
+        backend = self.create(name=name)
+        gate = Gate(policy=make_policy(), storage=backend)
+        return gate, backend
+
+    def keyed_transfer(self, gate, key, args=None):
+        args = dict(args or self.ARGS)
+        initial = gate.gate({
+            "action": "transfer_money", "args": args,
+            "idempotency_key": key,
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+        allowed = gate.gate({
+            "action": "transfer_money", "args": args,
+            "confirmation": initial["confirmation"],
+            "idempotency_key": key,
+        })
+        self.assertEqual(allowed["status"], "allowed")
+        return allowed
+
+    def keyless_transfer(self, gate, args=None):
+        args = dict(args or self.ARGS)
+        initial = gate.gate({
+            "action": "transfer_money", "args": args,
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+        allowed = gate.gate({
+            "action": "transfer_money", "args": args,
+            "confirmation": initial["confirmation"],
+        })
+        self.assertEqual(allowed["status"], "allowed")
+        return allowed
+
+    def build_keying_db(self, name, specs):
+        """Craft a chain-valid DB with explicit OUTCOME markers.
+
+        Each spec describes one transfer execution: ``marker`` is
+        "keyed", "keyless", "legacy", or a custom extra overlay dict;
+        ``key`` registers an operation row (None for OUTCOME-only);
+        ``receipt`` "new"/"legacy" completes it, None leaves pending.
+        A keyed marker uses ``marker_key`` when given, else ``key``.
+        Evidence crafting only: no keying rules are enforced here.
+        """
+        backend = self.create(name=name)
+        digest = arg_hash(dict(self.ARGS))
+        with backend.transaction():
+            for spec in specs:
+                SQLiteMutator(backend.ledger).apply_transfer(
+                    "alice", "bob", 100
+                )
+                entry = backend.journal.append_transfer(
+                    "alice", "bob", 100
+                )
+                backend.audit.append(
+                    kind="decision", actor="agent",
+                    action="transfer_money", arg_hash=digest,
+                    policy_version="v1",
+                    decision="confirmation_required", reason="ok",
+                    token_id="deadbeef", extra={},
+                )
+                backend.audit.append(
+                    kind="authorized", actor="agent",
+                    action="transfer_money", arg_hash=digest,
+                    policy_version="v1", decision="authorized",
+                    reason="ok", token_id="deadbeef", extra={},
+                )
+                extra = {
+                    "journal_seq": entry.seq,
+                    "source_balance": backend.ledger.balance("alice"),
+                    "target_balance": backend.ledger.balance("bob"),
+                }
+                marker = spec.get("marker", "legacy")
+                key = spec.get("key")
+                if marker == "keyed":
+                    extra["keyed"] = True
+                    extra["op_key"] = spec.get("marker_key", key)
+                elif marker == "keyless":
+                    extra["keyed"] = False
+                elif isinstance(marker, dict):
+                    extra.update(marker)
+                outcome = backend.audit.append(
+                    kind="outcome", actor="agent",
+                    action="transfer_money", arg_hash=digest,
+                    policy_version="v1", decision="allowed",
+                    reason="ok", token_id="deadbeef", extra=extra,
+                )
+                mode = spec.get("receipt")
+                if mode is not None and key is None:
+                    raise AssertionError(
+                        "keying spec needs key for receipt/op"
+                    )
+                if key is not None and mode is not None:
+                    receipt = {
+                        "action": "transfer_money", "source": "alice",
+                        "target": "bob", "amount": 100,
+                        "journal_seq": entry.seq,
+                        "source_balance": extra["source_balance"],
+                        "target_balance": extra["target_balance"],
+                        "policy_version": "v1",
+                    }
+                    if mode == "new":
+                        receipt["op_key"] = key
+                        receipt["audit_seq"] = outcome["seq"]
+                    backend.register_operation(
+                        key, "transfer_money", digest, "agent"
+                    )
+                    backend.complete_operation(key, receipt)
+                elif key is not None:
+                    backend.register_operation(
+                        key, "transfer_money", digest, "agent"
+                    )
+                backend.confirmations.issue(
+                    "transfer_money", digest, "v1"
+                )
+        backend.close()
+        return self.path(name)
+
+    def boot_epoch(self, name):
+        raw = sqlite3.connect(self.path(name))
+        try:
+            row = raw.execute(
+                "SELECT value FROM counters WHERE name = 'boot_epoch'"
+            ).fetchone()
+        finally:
+            raw.close()
+        return row[0]
+
+    def rewrite_receipt(self, name, key, mutate):
+        raw = sqlite3.connect(self.path(name))
+        try:
+            row = raw.execute(
+                "SELECT receipt_json FROM operations WHERE op_key = ?",
+                (key,),
+            ).fetchone()
+            receipt = json.loads(row[0])
+            mutate(receipt)
+            raw.execute(
+                "UPDATE operations SET receipt_json = ? "
+                "WHERE op_key = ?",
+                (json.dumps(receipt), key),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def assert_keying_refused(self, name, problem):
+        epoch = self.boot_epoch(name)
+        exc = self.assert_refused_unmodified(name, "operation_evidence")
+        self.assertEqual(exc.detail["problem"], problem)
+        self.assertEqual(self.boot_epoch(name), epoch)
+        return exc
+
+    def test_keyed_history_opens(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "ka-1")
+        self.keyed_transfer(gate, "ka-2", {
+            "source": "alice", "target": "carol", "amount": 50,
+        })
+        backend.close()
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_keyless_history_opens(self):
+        gate, backend = self.gate_pair()
+        self.keyless_transfer(gate)
+        self.keyless_transfer(gate)
+        backend.close()
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_mixed_legacy_keyed_opens(self):
+        self.build_keying_db("g.db", [
+            {"marker": "legacy"},
+            {"marker": "legacy", "key": "lx", "receipt": "legacy"},
+            {"marker": "keyed", "key": "kx", "receipt": "new"},
+        ])
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_mixed_legacy_keyless_opens(self):
+        self.build_keying_db("g.db", [
+            {"marker": "legacy", "key": "lx", "receipt": "legacy"},
+            {"marker": "keyless"},
+        ])
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_pending_keyless_coexistence_opens(self):
+        gate, backend = self.gate_pair()
+        initial = gate.gate({
+            "action": "transfer_money", "args": dict(self.ARGS),
+            "idempotency_key": "kp-1",
+        })
+        self.assertEqual(initial["status"], "confirmation_required")
+        self.keyless_transfer(gate)
+        backend.close()
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_same_fingerprint_distinct_executions_open(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "ks-1")
+        self.keyed_transfer(gate, "ks-2")
+        backend.close()
+        reopened = SQLiteBackend.open(self.path())
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("g.db"), 1)
+
+    def test_malformed_marker_refused(self):
+        overlays = [
+            {"keyed": "yes"},
+            {"keyed": True},
+            {"keyed": False, "op_key": "k"},
+        ]
+        for index, overlay in enumerate(overlays):
+            with self.subTest(overlay=overlay):
+                name = "m-%d.db" % index
+                self.build_keying_db(name, [{"marker": overlay}])
+                self.assert_keying_refused(name, "keying_malformed")
+
+    def test_malformed_receipt_pair_refused(self):
+        def drop_seq(receipt):
+            receipt.pop("audit_seq")
+
+        def drop_key(receipt):
+            receipt.pop("op_key")
+
+        for index, mutate in enumerate((drop_seq, drop_key)):
+            with self.subTest(index=index):
+                name = "p-%d.db" % index
+                gate, backend = self.gate_pair(name)
+                self.keyed_transfer(gate, "k")
+                backend.close()
+                self.rewrite_receipt(name, "k", mutate)
+                self.assert_keying_refused(
+                    name, "receipt_keying_malformed"
+                )
+
+    def test_deleted_record_refused(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k")
+        backend.close()
+        self.corrupt("g.db", [
+            ("DELETE FROM operations WHERE op_key = ?", ("k",)),
+            ("UPDATE confirmations SET op_key = NULL "
+             "WHERE op_key = ?", ("k",)),
+        ])
+        self.assert_keying_refused("g.db", "outcome_orphaned")
+
+    def test_keyed_pending_refused(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k")
+        backend.close()
+        self.corrupt("g.db", [
+            ("UPDATE operations SET status = 'pending', "
+             "receipt_json = NULL WHERE op_key = ?", ("k",)),
+        ])
+        self.assert_keying_refused("g.db", "keyed_pending")
+
+    def test_wrong_audit_seq_refused(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k")
+        backend.close()
+        self.rewrite_receipt(
+            "g.db", "k", lambda r: r.update(audit_seq=999)
+        )
+        self.assert_keying_refused("g.db", "receipt_position_mismatch")
+
+    def test_wrong_op_key_refused(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k")
+        backend.close()
+        self.rewrite_receipt(
+            "g.db", "k", lambda r: r.update(op_key="intruder")
+        )
+        self.assert_keying_refused("g.db", "receipt_key_mismatch")
+
+    def test_dual_position_claim_refused(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k1")
+        self.keyed_transfer(gate, "k2")
+        backend.close()
+        raw = sqlite3.connect(self.path())
+        try:
+            seqs = [
+                row[0] for row in raw.execute(
+                    "SELECT seq FROM audit WHERE kind = 'outcome' "
+                    "AND decision = 'allowed' ORDER BY seq"
+                )
+            ]
+        finally:
+            raw.close()
+        self.rewrite_receipt(
+            "g.db", "k2", lambda r: r.update(audit_seq=seqs[0])
+        )
+        self.assert_keying_refused("g.db", "receipt_position_mismatch")
+
+    def test_dual_outcome_claim_refused(self):
+        self.build_keying_db("g.db", [
+            {"marker": "keyed", "key": "k", "receipt": "new"},
+            {"marker": "keyed", "marker_key": "k"},
+        ])
+        self.assert_keying_refused("g.db", "receipt_position_mismatch")
+
+    def test_keyless_contradiction_refused(self):
+        self.build_keying_db("g.db", [
+            {"marker": "keyless", "key": "kc", "receipt": "legacy"},
+        ])
+        self.assert_keying_refused("g.db", "keyless_contradiction")
+
+    def test_checkpoint_untouched_on_keying_refusal(self):
+        gate, backend = self.gate_pair()
+        self.keyed_transfer(gate, "k")
+        raw = sqlite3.connect(self.path())
+        try:
+            head = raw.execute(
+                "SELECT seq, record_hash FROM audit "
+                "ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            raw.close()
+        backend.checkpoint(
+            self.path("c.json"), deployment_id="test-deploy",
+            expected_seq=head[0], expected_hash=head[1],
+        )
+        backend.close()
+        with open(self.path("c.json"), "rb") as handle:
+            before = handle.read()
+        self.rewrite_receipt(
+            "g.db", "k", lambda r: r.update(audit_seq=999)
+        )
+        with self.assertRaises(VerificationError) as caught:
+            SQLiteBackend.open(
+                self.path(), checkpoint_path=self.path("c.json"),
+                deployment_id="test-deploy",
+            )
+        self.assertEqual(
+            caught.exception.category, "operation_evidence"
+        )
+        with open(self.path("c.json"), "rb") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_valid_open_after_refusal(self):
+        gate, backend = self.gate_pair("bad.db")
+        self.keyed_transfer(gate, "k")
+        backend.close()
+        self.rewrite_receipt(
+            "bad.db", "k", lambda r: r.update(audit_seq=999)
+        )
+        with self.assertRaises(VerificationError):
+            SQLiteBackend.open(self.path("bad.db"))
+        gate2, backend2 = self.gate_pair("good.db")
+        self.keyed_transfer(gate2, "g")
+        backend2.close()
+        reopened = SQLiteBackend.open(self.path("good.db"))
+        self._backends.append(reopened)
+        self.assertEqual(self.boot_epoch("good.db"), 1)
 
 
 if __name__ == "__main__":

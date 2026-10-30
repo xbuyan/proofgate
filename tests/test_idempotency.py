@@ -16,9 +16,11 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from proofgate.audit import AuditError
+from proofgate.canonical import arg_hash
 from proofgate.enforcement import Gate
 from proofgate.policy import Policy
 from proofgate.sqlite_backend import SQLiteBackend
+from proofgate.sqlite_backend import _Mutator as SQLiteMutator
 
 
 def make_policy(**overrides):
@@ -678,6 +680,316 @@ class ConcurrencyTests(IdempotencyCase):
         self.assertEqual(
             gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
         )
+
+
+class KeyingIntegrationTests(IdempotencyCase):
+    """Slice B Phase 2: markers, receipt identity and position."""
+
+    def keyed_transfer(self, gate, key):
+        token = self.initial(gate, key)["confirmation"]
+        allowed = self.redeem(gate, token, key)
+        self.assertEqual(allowed["status"], "allowed")
+        return allowed
+
+    def allowed_outcomes(self, gate):
+        return [
+            r for r in gate.audit_records()
+            if r["kind"] == "outcome" and r["decision"] == "allowed"
+        ]
+
+    def tamper_cases(self):
+        return [
+            ("wrong_seq", lambda r: r.update(audit_seq=999)),
+            ("wrong_key", lambda r: r.update(op_key="intruder")),
+            ("missing_seq", lambda r: r.pop("audit_seq")),
+            ("missing_key", lambda r: r.pop("op_key")),
+        ]
+
+    def tamper_stored_receipt(self, name, key, mutate):
+        conn = sqlite3.connect(self.path(name))
+        try:
+            row = conn.execute(
+                "SELECT receipt_json FROM operations WHERE op_key = ?",
+                (key,),
+            ).fetchone()
+            receipt = json.loads(row[0])
+            mutate(receipt)
+            conn.execute(
+                "UPDATE operations SET receipt_json = ? "
+                "WHERE op_key = ?",
+                (json.dumps(receipt), key),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def craft_legacy_committed(self, gate, key):
+        token = self.initial(gate)["confirmation"]
+        self.redeem(gate, token)
+        outcome = self.allowed_outcomes(gate)[-1]
+        receipt = {
+            "action": "transfer_money", "source": "alice",
+            "target": "bob", "amount": 100,
+            "journal_seq": outcome["extra"]["journal_seq"],
+            "source_balance": outcome["extra"]["source_balance"],
+            "target_balance": outcome["extra"]["target_balance"],
+            "policy_version": outcome["policy_version"],
+        }
+        storage = gate._storage
+        with storage.transaction():
+            storage.register_operation(
+                key, "transfer_money", outcome["arg_hash"], "agent"
+            )
+            storage.complete_operation(key, receipt)
+        return receipt
+
+    def craft_legacy_committed_sqlite(self, backend, key):
+        """Build a genuinely legacy committed operation (SQLite).
+
+        All evidence is pre-Slice-B shape: the OUTCOME extra holds
+        only journal/ledger fields (no keyed marker) and the receipt
+        holds neither op_key nor audit_seq. Backend API only.
+        """
+        digest = arg_hash(args())
+        with backend.transaction():
+            SQLiteMutator(backend.ledger).apply_transfer(
+                "alice", "bob", 100
+            )
+            entry = backend.journal.append_transfer(
+                "alice", "bob", 100
+            )
+            backend.audit.append(
+                kind="decision", actor="agent",
+                action="transfer_money", arg_hash=digest,
+                policy_version="v1",
+                decision="confirmation_required", reason="ok",
+                token_id="deadbeef", extra={},
+            )
+            backend.audit.append(
+                kind="authorized", actor="agent",
+                action="transfer_money", arg_hash=digest,
+                policy_version="v1", decision="authorized",
+                reason="ok", token_id="deadbeef", extra={},
+            )
+            backend.audit.append(
+                kind="outcome", actor="agent",
+                action="transfer_money", arg_hash=digest,
+                policy_version="v1", decision="allowed",
+                reason="ok", token_id="deadbeef",
+                extra={
+                    "journal_seq": entry.seq,
+                    "source_balance": backend.ledger.balance("alice"),
+                    "target_balance": backend.ledger.balance("bob"),
+                },
+            )
+            receipt = {
+                "action": "transfer_money", "source": "alice",
+                "target": "bob", "amount": 100,
+                "journal_seq": entry.seq,
+                "source_balance": backend.ledger.balance("alice"),
+                "target_balance": backend.ledger.balance("bob"),
+                "policy_version": "v1",
+            }
+            backend.register_operation(
+                key, "transfer_money", digest, "agent"
+            )
+            backend.complete_operation(key, receipt)
+            backend.confirmations.issue(
+                "transfer_money", digest, "v1"
+            )
+        return receipt
+
+    def corrupt_append_seq(self, gate):
+        original = gate._audit.append
+
+        def bad_seq_append(*args, **kwargs):
+            record = original(*args, **kwargs)
+            return dict(record, seq="bad")
+
+        gate._audit.append = bad_seq_append
+        return original
+
+    def test_keyed_marker_and_receipt_memory(self):
+        gate = self.make_memory_gate()
+        allowed = self.keyed_transfer(gate, "km-1")
+        (outcome,) = self.allowed_outcomes(gate)
+        self.assertTrue(outcome["extra"]["keyed"])
+        self.assertEqual(outcome["extra"]["op_key"], "km-1")
+        receipt = allowed["receipt"]
+        self.assertEqual(receipt["op_key"], "km-1")
+        self.assertEqual(receipt["audit_seq"], outcome["seq"])
+        stored = gate.operation_status("km-1")
+        self.assertEqual(stored["status"], "committed")
+        self.assertEqual(stored["receipt"], receipt)
+
+    def test_keyless_marker_memory(self):
+        gate = self.make_memory_gate()
+        token = self.initial(gate)["confirmation"]
+        allowed = self.redeem(gate, token)
+        (outcome,) = self.allowed_outcomes(gate)
+        self.assertFalse(outcome["extra"]["keyed"])
+        self.assertNotIn("op_key", outcome["extra"])
+        self.assertEqual(
+            set(allowed["receipt"]),
+            {"action", "source", "target", "amount", "journal_seq",
+             "source_balance", "target_balance", "policy_version"},
+        )
+
+    def test_keyed_marker_and_receipt_sqlite(self):
+        gate, backend = self.make_gate()
+        allowed = self.keyed_transfer(gate, "ks-1")
+        (outcome,) = self.allowed_outcomes(gate)
+        self.assertTrue(outcome["extra"]["keyed"])
+        self.assertEqual(outcome["extra"]["op_key"], "ks-1")
+        self.assertEqual(allowed["receipt"]["op_key"], "ks-1")
+        self.assertEqual(allowed["receipt"]["audit_seq"], outcome["seq"])
+        gate2, _ = self.reopen(backend)
+        stored = gate2.operation_status("ks-1")
+        self.assertEqual(stored["status"], "committed")
+        self.assertEqual(stored["receipt"], allowed["receipt"])
+
+    def test_keyless_marker_sqlite(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate)["confirmation"]
+        allowed = self.redeem(gate, token)
+        (outcome,) = self.allowed_outcomes(gate)
+        self.assertFalse(outcome["extra"]["keyed"])
+        self.assertNotIn("op_key", outcome["extra"])
+        self.assertNotIn("op_key", allowed["receipt"])
+        self.assertNotIn("audit_seq", allowed["receipt"])
+
+    def test_duplicate_preserves_stored_pair(self):
+        gates = [
+            self.make_memory_gate(),
+            self.make_gate(name="kd.db")[0],
+        ]
+        for index, gate in enumerate(gates):
+            with self.subTest(backend=index):
+                key = "kd-%d" % index
+                allowed = self.keyed_transfer(gate, key)
+                again = self.initial(gate, key)
+                self.assertTrue(again["duplicate"])
+                self.assertEqual(again["receipt"], allowed["receipt"])
+                self.assertEqual(
+                    again["receipt"]["op_key"], key
+                )
+                self.assertEqual(
+                    again["receipt"]["audit_seq"],
+                    allowed["receipt"]["audit_seq"],
+                )
+                self.assertEqual(len(gate.journal_entries()), 1)
+
+    def test_legacy_receipt_compatible_memory(self):
+        gate = self.make_memory_gate()
+        legacy = self.craft_legacy_committed(gate, "kl-m")
+        stored = gate.operation_status("kl-m")
+        self.assertEqual(stored["status"], "committed")
+        self.assertEqual(stored["receipt"], legacy)
+        again = self.initial(gate, "kl-m")
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["receipt"], legacy)
+
+    def test_legacy_receipt_compatible_sqlite(self):
+        _, backend = self.make_gate()
+        legacy = self.craft_legacy_committed_sqlite(backend, "kl-s")
+        gate2, _ = self.reopen(backend)
+        outcomes = [
+            record for record in gate2.audit_records()
+            if record["kind"] == "outcome"
+            and record["decision"] == "allowed"
+        ]
+        (outcome,) = outcomes
+        self.assertNotIn("keyed", outcome["extra"])
+        stored = gate2.operation_status("kl-s")
+        self.assertEqual(stored["status"], "committed")
+        self.assertEqual(stored["receipt"], legacy)
+        self.assertNotIn("op_key", stored["receipt"])
+        self.assertNotIn("audit_seq", stored["receipt"])
+
+    def test_tampered_pair_memory(self):
+        for name, mutate in self.tamper_cases():
+            with self.subTest(case=name):
+                gate = self.make_memory_gate()
+                self.keyed_transfer(gate, "kt-m")
+                mutate(gate._storage._operations["kt-m"]["receipt"])
+                status = gate.operation_status("kt-m")
+                self.assertEqual(status["status"], "error")
+                self.assertEqual(
+                    status["reason"], "operation_unverifiable"
+                )
+                self.assertFalse(gate.status()["degraded"])
+                again = self.initial(gate, "kt-m")
+                self.assertEqual(again["status"], "error")
+                self.assertEqual(
+                    again["reason"], "operation_unverifiable"
+                )
+                self.assertTrue(gate.status()["degraded"])
+                self.assertEqual(len(gate.journal_entries()), 1)
+                refused = self.initial(gate)
+                self.assertEqual(refused["reason"], "degraded")
+
+    def test_tampered_pair_sqlite(self):
+        for index, (name, mutate) in enumerate(self.tamper_cases()):
+            with self.subTest(case=name):
+                db = "kt-s-%d.db" % index
+                gate, _ = self.make_gate(name=db)
+                self.keyed_transfer(gate, "kt-s")
+                # Mid-session tamper through a second connection;
+                # the backend stays open, so this exercises runtime
+                # detection (startup verification never runs here).
+                self.tamper_stored_receipt(db, "kt-s", mutate)
+                status = gate.operation_status("kt-s")
+                self.assertEqual(status["status"], "error")
+                self.assertEqual(
+                    status["reason"], "operation_unverifiable"
+                )
+                self.assertFalse(gate.status()["degraded"])
+                again = self.initial(gate, "kt-s")
+                self.assertEqual(again["status"], "error")
+                self.assertEqual(
+                    again["reason"], "operation_unverifiable"
+                )
+                self.assertTrue(gate.status()["degraded"])
+                self.assertEqual(len(gate.journal_entries()), 1)
+                refused = self.initial(gate)
+                self.assertEqual(refused["reason"], "degraded")
+
+    def test_malformed_seq_memory(self):
+        gate = self.make_memory_gate()
+        token = self.initial(gate, "kq-m")["confirmation"]
+        original = self.corrupt_append_seq(gate)
+        try:
+            response = self.redeem(gate, token, "kq-m")
+        finally:
+            gate._audit.append = original
+        self.assertEqual(
+            response["status"], "executed_recording_failed"
+        )
+        self.assertEqual(response["reason"], "outcome_unrecorded")
+        self.assertTrue(gate.status()["degraded"])
+        pending = gate.operation_status("kq-m")
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(len(gate.journal_entries()), 1)
+        self.assertEqual(
+            gate.ledger_snapshot(), {"alice": 9900, "bob": 100}
+        )
+
+    def test_malformed_seq_sqlite(self):
+        gate, _ = self.make_gate()
+        token = self.initial(gate, "kq-s")["confirmation"]
+        original = self.corrupt_append_seq(gate)
+        try:
+            response = self.redeem(gate, token, "kq-s")
+        finally:
+            gate._audit.append = original
+        self.assertEqual(
+            response["status"], "executed_recording_failed"
+        )
+        self.assertEqual(response["reason"], "outcome_unrecorded")
+        self.assertTrue(gate.status()["degraded"])
+        pending = gate.operation_status("kq-s")
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(len(gate.journal_entries()), 1)
 
 
 if __name__ == "__main__":

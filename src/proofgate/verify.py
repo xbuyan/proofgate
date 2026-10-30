@@ -33,8 +33,12 @@ from .tools import is_valid_idempotency_key
 
 __all__ = [
     "VerificationError",
+    "check_keyed_outcome",
+    "check_keyless_outcome",
+    "check_receipt_keying",
     "cross_check_journal_audit",
     "operation_receipt_consistent",
+    "outcome_keying_state",
     "reconcile",
     "verify_database",
 ]
@@ -260,14 +264,214 @@ def operation_receipt_consistent(op_action, op_arg_hash, receipt,
     return None
 
 
+def _is_valid_journal_seq(value):
+    """Canonical journal-sequence shape: positive int, never bool."""
+    return _is_int(value) and value >= 1
+
+
+def outcome_keying_state(outcome):
+    """Classify an OUTCOME record's keying evidence. Pure.
+
+    Returns ``(kind, detail)``: ``("legacy", None)`` when no keying
+    marker is present, ``("keyed", op_key)`` for a well-formed keyed
+    marker, ``("keyless", None)`` for a well-formed keyless marker, or
+    ``("malformed", problem)`` for present-but-invalid evidence. An
+    absent marker and a malformed marker are never conflated.
+    """
+    if not isinstance(outcome, dict):
+        return ("malformed", "bad_outcome_shape")
+    extra = outcome.get("extra")
+    if not isinstance(extra, dict):
+        return ("malformed", "bad_outcome_shape")
+    if "keyed" not in extra:
+        return ("legacy", None)
+    keyed = extra["keyed"]
+    if not isinstance(keyed, bool):
+        return ("malformed", "keying_malformed")
+    if keyed:
+        op_key = extra.get("op_key")
+        if (
+            not isinstance(op_key, str)
+            or not op_key
+            or not is_valid_idempotency_key(op_key)
+        ):
+            return ("malformed", "keying_malformed")
+        return ("keyed", op_key)
+    if "op_key" in extra:
+        return ("malformed", "keying_malformed")
+    return ("keyless", None)
+
+
+def check_keyless_outcome(outcome, operations):
+    """Fail closed when a keyless OUTCOME is contradicted. Pure.
+
+    *outcome* must be keyless-marked (see :func:`outcome_keying_state`);
+    its ``(action, arg_hash, journal_seq)`` must be well-shaped or a
+    malformed code is returned instead of a silent pass. Returns
+    ``"keyless_contradiction"`` when a committed operation claims the
+    same execution, else ``None``. Malformed operation rows are skipped
+    here: they are the subject of dedicated shape findings elsewhere,
+    which fail independently.
+    """
+    if not isinstance(outcome, dict):
+        return "bad_outcome_shape"
+    action = outcome.get("action")
+    arg_hash = outcome.get("arg_hash")
+    if (
+        not isinstance(action, str) or not action
+        or not isinstance(arg_hash, str) or not arg_hash
+    ):
+        return "bad_outcome_shape"
+    extra = outcome.get("extra")
+    if not isinstance(extra, dict):
+        return "bad_outcome_shape"
+    journal_seq = extra.get("journal_seq")
+    if not _is_valid_journal_seq(journal_seq):
+        return "bad_outcome_shape"
+    for record in operations:
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") != "committed":
+            continue
+        if record.get("action") != action:
+            continue
+        if record.get("arg_hash") != arg_hash:
+            continue
+        receipt = record.get("receipt")
+        if not isinstance(receipt, dict):
+            continue
+        if not _is_valid_journal_seq(receipt.get("journal_seq")):
+            continue
+        if receipt.get("journal_seq") != journal_seq:
+            continue
+        return "keyless_contradiction"
+    return None
+
+
+def check_receipt_keying(record, audit_records):
+    """Validate a committed record's identity-position pair. Pure.
+
+    Both ``op_key`` and ``audit_seq`` absent means legacy: returns
+    ``None`` (the caller skips position checks). Otherwise both must be
+    present and valid, and the ``allowed`` OUTCOME at
+    ``receipt["audit_seq"]`` must carry the matching keyed marker and
+    execution content. Any violation returns a problem code. Callers
+    must supply audit records with unique integer sequences (chain
+    verification establishes this at startup and in manifests); the
+    position scan takes the first sequence match. Content
+    and journal linkage stay with :func:`operation_receipt_consistent`;
+    callers enforcing full evidence must call both.
+    """
+    if not isinstance(record, dict):
+        return "bad_operation_shape"
+    key = record.get("key")
+    receipt = record.get("receipt")
+    if not isinstance(receipt, dict):
+        return "bad_receipt_shape"
+    key_present = "op_key" in receipt
+    seq_present = "audit_seq" in receipt
+    if not key_present and not seq_present:
+        return None
+    if not (key_present and seq_present):
+        return "receipt_keying_malformed"
+    op_key = receipt["op_key"]
+    audit_seq = receipt["audit_seq"]
+    if (
+        not isinstance(op_key, str)
+        or not is_valid_idempotency_key(op_key)
+        or op_key != key
+    ):
+        return "receipt_key_mismatch"
+    if not _is_int(audit_seq) or audit_seq < 1:
+        return "receipt_position_invalid"
+    target = None
+    for candidate in audit_records:
+        if not isinstance(candidate, dict):
+            continue
+        if not _is_int(candidate.get("seq")):
+            continue
+        if candidate.get("seq") == audit_seq:
+            target = candidate
+            break
+    if target is None:
+        return "receipt_position_mismatch"
+    if target.get("kind") != "outcome":
+        return "receipt_position_mismatch"
+    if target.get("decision") != "allowed":
+        return "receipt_position_mismatch"
+    state, detail = outcome_keying_state(target)
+    if state != "keyed" or detail != key:
+        return "receipt_position_mismatch"
+    if (
+        target.get("action") != record.get("action")
+        or target.get("arg_hash") != record.get("arg_hash")
+        or target.get("policy_version") != receipt.get("policy_version")
+    ):
+        return "receipt_position_mismatch"
+    extra = target.get("extra")
+    if not isinstance(extra, dict):
+        return "bad_outcome_shape"
+    if not _is_valid_journal_seq(extra.get("journal_seq")):
+        return "bad_outcome_shape"
+    if not _is_valid_journal_seq(receipt.get("journal_seq")):
+        return "bad_receipt_shape"
+    if (
+        extra.get("journal_seq") != receipt.get("journal_seq")
+        or extra.get("source_balance")
+        != receipt.get("source_balance")
+        or extra.get("target_balance")
+        != receipt.get("target_balance")
+    ):
+        return "receipt_position_mismatch"
+    return None
+
+
+def check_keyed_outcome(outcome, op_key, operations, audit_records):
+    """Validate a keyed-marked OUTCOME against operations. Pure.
+
+    *op_key* is the marker identity established via
+    :func:`outcome_keying_state`. Returns ``None`` only when committed
+    *op_key* exists with a new-format receipt pinned to this exact
+    OUTCOME; otherwise returns a problem code.
+    """
+    if not isinstance(outcome, dict):
+        return "bad_outcome_shape"
+    seq = outcome.get("seq")
+    if not _is_int(seq):
+        return "bad_outcome_shape"
+    matches = [
+        record for record in operations
+        if isinstance(record, dict) and record.get("key") == op_key
+    ]
+    if not matches:
+        return "outcome_orphaned"
+    if len(matches) > 1:
+        return "duplicate_operation_key"
+    record = matches[0]
+    if record.get("status") != "committed":
+        return "keyed_pending"
+    receipt = record.get("receipt")
+    if not isinstance(receipt, dict):
+        return "bad_receipt_shape"
+    if "op_key" not in receipt or "audit_seq" not in receipt:
+        return "keyed_legacy_receipt"
+    problem = check_receipt_keying(record, audit_records)
+    if problem is not None:
+        return problem
+    if receipt.get("audit_seq") != seq:
+        return "receipt_position_mismatch"
+    return None
+
+
 def verify_database(conn, expected_version, required_tables):
     """Verify a ProofGate database for startup. Read-only.
 
     Checks, in order: SQLite integrity (``PRAGMA quick_check``),
     schema version, required tables, metadata, policy, counters,
     ledger, confirmations, operations, journal continuity, the full
-    audit chain, ledger/journal/audit reconciliation, and committed
-    receipt evidence binding. Only ``SELECT`` and ``PRAGMA``
+    audit chain, ledger/journal/audit reconciliation, committed
+    receipt evidence binding, and OUTCOME/receipt keying evidence.
+    Only ``SELECT`` and ``PRAGMA``
     statements run; no application state is written.
 
     Raises :class:`VerificationError` naming the failed category.
@@ -468,6 +672,7 @@ def verify_database(conn, expected_version, required_tables):
         stage = "operations"
         op_keys = set()
         committed = []
+        op_records = []
         for row in conn.execute(
             "SELECT op_key, action, arg_hash, actor, status, "
             "receipt_json, created_epoch, updated_epoch "
@@ -500,6 +705,13 @@ def verify_database(conn, expected_version, required_tables):
                     raise VerificationError(
                         stage, {"problem": "pending_receipt"}
                     )
+                op_record = {
+                    "key": key,
+                    "status": status,
+                    "action": action,
+                    "arg_hash": arg_hash,
+                    "receipt": None,
+                }
             else:
                 try:
                     receipt = json.loads(blob)
@@ -511,7 +723,14 @@ def verify_database(conn, expected_version, required_tables):
                     raise VerificationError(
                         stage, {"problem": "bad_receipt"}
                     )
-                committed.append((action, arg_hash, receipt))
+                op_record = {
+                    "key": key,
+                    "status": status,
+                    "action": action,
+                    "arg_hash": arg_hash,
+                    "receipt": receipt,
+                }
+                committed.append(op_record)
             if (
                 not _is_int(created) or created < 0
                 or not _is_int(updated) or updated < 0
@@ -520,6 +739,7 @@ def verify_database(conn, expected_version, required_tables):
                     stage, {"problem": "bad_epoch"}
                 )
             op_keys.add(key)
+            op_records.append(op_record)
         for row in conn.execute(
             "SELECT op_key FROM confirmations "
             "WHERE op_key IS NOT NULL"
@@ -617,16 +837,46 @@ def verify_database(conn, expected_version, required_tables):
             )
 
         stage = "operation_evidence"
-        for index, (op_action, op_arg_hash, receipt) in enumerate(
-            committed
-        ):
+        for index, op in enumerate(committed):
             problem = operation_receipt_consistent(
-                op_action, op_arg_hash, receipt, entries, records
+                op["action"], op["arg_hash"], op["receipt"],
+                entries, records
             )
             if problem is not None:
                 raise VerificationError(
                     stage,
                     {"index": index, "problem": problem},
+                )
+        for op in committed:
+            problem = check_receipt_keying(op, records)
+            if problem is not None:
+                raise VerificationError(
+                    stage,
+                    {"key": op["key"], "problem": problem},
+                )
+        for outcome in records:
+            if outcome.get("kind") != "outcome":
+                continue
+            if outcome.get("decision") != "allowed":
+                continue
+            state, detail = outcome_keying_state(outcome)
+            if state == "malformed":
+                raise VerificationError(
+                    stage,
+                    {"seq": outcome.get("seq"), "problem": detail},
+                )
+            if state == "legacy":
+                continue
+            if state == "keyed":
+                problem = check_keyed_outcome(
+                    outcome, detail, op_records, records
+                )
+            else:
+                problem = check_keyless_outcome(outcome, op_records)
+            if problem is not None:
+                raise VerificationError(
+                    stage,
+                    {"seq": outcome.get("seq"), "problem": problem},
                 )
     except VerificationError:
         raise

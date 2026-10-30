@@ -30,6 +30,25 @@ coexistence reports unresolved. A committed-to-pending status flip is
 therefore indistinguishable from that legitimate case in Slice A
 evidence and likewise degrades to unresolved; detecting it needs
 OUTCOME keying evidence (a later slice).
+
+Slice B / manifest v2. New histories carry explicit OUTCOME keying
+markers (``keyed: True`` + ``op_key``, or ``keyed: False``) and keyed
+committed receipts carry the ``(op_key, audit_seq)`` identity-position
+pair. Version 2 manifests classify marker-bearing records with the
+shared Slice B helpers, report proven-keyless executions as
+``keyless`` (never ``unresolved``, never with an ``op_key``), and
+restrict the legacy fingerprint join to receipts with both keying
+fields absent so a legacy OUTCOME can never borrow a Slice B
+identity. Version 1 behavior is frozen: v1 building and verification
+are explicit opt-in, refuse marker-bearing histories, and report
+under the ``v1-legacy`` rules label.
+
+Caller precondition (both versions, both entry points): the supplied
+audit records, journal entries, and operation registry must be the
+COMPLETE verified local history -- range parameters scope entry
+enumeration only, never identity evidence. Completeness cannot be
+proven from caller snapshots alone; production callers must pass the
+full backend enumeration. C-O remains unresolved in every version.
 """
 
 import copy
@@ -38,19 +57,25 @@ import hashlib
 from .audit import _verify_chain
 from .canonical import CanonicalizationError, canonicalize
 from .verify import (
+    check_keyed_outcome,
+    check_keyless_outcome,
+    check_receipt_keying,
     cross_check_journal_audit,
     operation_receipt_consistent,
+    outcome_keying_state,
     reconcile,
 )
 
 __all__ = [
     "MANIFEST_VERSION",
+    "MANIFEST_VERSION_V2",
     "ManifestError",
     "build_manifest",
     "verify_local_consistency",
 ]
 
 MANIFEST_VERSION = 1
+MANIFEST_VERSION_V2 = 2
 
 CO_UNRESOLVED = "unresolved"
 CO_REASON_NO_EVIDENCE = "no_independent_occurrence_evidence"
@@ -131,15 +156,24 @@ def _require_range(range_start, range_end):
         )
 
 
-def _require_manifest(manifest):
-    if not isinstance(manifest, dict):
-        raise ManifestError("bad_manifest", {"expected": "dict"})
-    if manifest.get("format_version") != MANIFEST_VERSION or isinstance(
-        manifest.get("format_version"), bool
+def _require_version(value):
+    """Return 1 or 2; raise for anything else (bools included)."""
+    if isinstance(value, bool) or value not in (
+        MANIFEST_VERSION, MANIFEST_VERSION_V2
     ):
         raise ManifestError(
-            "unsupported_manifest_version",
-            {"found": manifest.get("format_version")},
+            "unsupported_manifest_version", {"found": value}
+        )
+    return value
+
+
+def _require_manifest(manifest, allow_legacy_v1):
+    if not isinstance(manifest, dict):
+        raise ManifestError("bad_manifest", {"expected": "dict"})
+    version = _require_version(manifest.get("format_version"))
+    if version == MANIFEST_VERSION and not allow_legacy_v1:
+        raise ManifestError(
+            "legacy_verification_not_enabled", {"found": version}
         )
     try:
         _require_range(manifest.get("range_start"), manifest.get("range_end"))
@@ -155,13 +189,44 @@ def _require_manifest(manifest):
             raise ManifestError(
                 "bad_manifest_entries", {"index": index}
             )
-    for key in ("op_count", "keyed_count", "unresolved_count"):
+    count_keys = ("op_count", "keyed_count", "unresolved_count")
+    if version == MANIFEST_VERSION_V2:
+        count_keys = count_keys + ("keyless_count",)
+    for key in count_keys:
         value = manifest.get(key)
         if not _is_int(value) or value < 0:
             raise ManifestError("bad_manifest_counts", {"key": key})
     for key in ("entries_root", "manifest_digest"):
         if not isinstance(manifest.get(key), str):
             raise ManifestError("bad_manifest_digests", {"key": key})
+    return version
+
+
+def _history_has_markers(records, operations):
+    """True when any Slice B keying evidence is present.
+
+    Scans every OUTCOME for a ``keyed`` field (any value) and every
+    operation record regardless of status for ``op_key``/``audit_seq``
+    receipt fields. A non-null non-dict receipt counts as
+    marker-bearing: malformed evidence must fail closed, never read
+    as marker-free. Shape problems themselves are reported by the
+    dedicated checks; this gate only answers the v1-policy question.
+    """
+    for record in records:
+        if record.get("kind") != "outcome":
+            continue
+        extra = record.get("extra")
+        if isinstance(extra, dict) and "keyed" in extra:
+            return True
+    for record in operations:
+        receipt = record.get("receipt")
+        if receipt is None:
+            continue
+        if not isinstance(receipt, dict):
+            return True
+        if "op_key" in receipt or "audit_seq" in receipt:
+            return True
+    return False
 
 
 def _record_shape_valid(record):
@@ -210,15 +275,11 @@ def _eligible_outcomes(records, range_start, range_end):
     )
 
 
-def _classify(outcome, journal_by_seq, operations):
-    """Classify one eligible OUTCOME.
+def _journal_link(outcome, journal_by_seq):
+    """Validate shape and journal linkage; shared by both versions.
 
-    Returns ``(entry_or_None, problem_or_None)``. A keyed entry needs a
-    committed record matching action, argument hash, and journal
-    sequence. Anything else is unresolved or inconsistent; keying is
-    never inferred. The token-id prefix is deliberately ignored: it is
-    non-unique and its rows are purged or cleared while operation
-    records survive, so it cannot serve as join evidence.
+    Returns ``(action, arg_hash, journal_seq, journal, problem)``
+    with exactly one side set.
     """
     seq = outcome["seq"]
     extra = outcome.get("extra")
@@ -227,19 +288,43 @@ def _classify(outcome, journal_by_seq, operations):
         or not _is_int(extra.get("journal_seq"))
         or extra["journal_seq"] < 1
     ):
-        return None, _problem("bad_outcome_shape", audit_seq=seq)
+        return (
+            None, None, None, None,
+            _problem("bad_outcome_shape", audit_seq=seq),
+        )
     action = outcome.get("action")
     arg_hash = outcome.get("arg_hash")
     journal_seq = extra["journal_seq"]
     journal = journal_by_seq.get(journal_seq)
     if journal is None:
-        return None, _problem(
-            "journal_gap", audit_seq=seq, journal_seq=journal_seq
+        return (
+            None, None, None, None,
+            _problem(
+                "journal_gap", audit_seq=seq,
+                journal_seq=journal_seq,
+            ),
         )
     if journal.action != action:
-        return None, _problem(
-            "journal_mismatch", audit_seq=seq, journal_seq=journal_seq
+        return (
+            None, None, None, None,
+            _problem(
+                "journal_mismatch", audit_seq=seq,
+                journal_seq=journal_seq,
+            ),
         )
+    return action, arg_hash, journal_seq, journal, None
+
+
+def _legacy_join(seq, action, arg_hash, journal_seq, journal,
+                 operations, policy_version, keying_source):
+    """Join a marker-absent OUTCOME to a legacy receipt.
+
+    Returns ``(entry_or_None, problem_or_None)``. Only receipts with
+    BOTH keying fields absent are eligible: any receipt carrying
+    ``op_key`` or ``audit_seq`` belongs to Slice B evidence and must
+    never be borrowed as a legacy identity. ``keying_source`` labels
+    v2 entries; v1 entries keep their frozen shape (no label).
+    """
     matches = [
         record
         for record in operations
@@ -249,6 +334,8 @@ def _classify(outcome, journal_by_seq, operations):
         and record.get("action") == action
         and record.get("arg_hash") == arg_hash
         and isinstance(record.get("receipt"), dict)
+        and "op_key" not in record["receipt"]
+        and "audit_seq" not in record["receipt"]
         and record["receipt"].get("journal_seq") == journal_seq
     ]
     if len(matches) > 1:
@@ -268,7 +355,7 @@ def _classify(outcome, journal_by_seq, operations):
                 key=record["key"],
                 audit_seq=seq,
             )
-        return {
+        entry = {
             "audit_seq": seq,
             "op_key": record["key"],
             "action": action,
@@ -282,32 +369,142 @@ def _classify(outcome, journal_by_seq, operations):
             "source_balance": receipt.get("source_balance"),
             "target_balance": receipt.get("target_balance"),
             "classification": "keyed",
-        }, None
+        }
+        if keying_source is not None:
+            entry["keying_source"] = keying_source
+        return entry, None
     # No pending check here: a pending record with the same fingerprint
     # legitimately coexists with this OUTCOME (a keyless execution plus
     # a pending keyed request with identical arguments). Treating that
     # as a conflict would fail legitimate histories.
-    return {
+    entry = {
         "audit_seq": seq,
         "action": action,
         "arg_hash": arg_hash,
         "journal_seq": journal_seq,
-        "policy_version": outcome.get("policy_version"),
+        "policy_version": policy_version,
         "source": journal.source,
         "target": journal.target,
         "amount": journal.amount,
         "classification": "unresolved",
         "reason": "keying_indeterminable",
-    }, None
+    }
+    if keying_source is not None:
+        entry["keying_source"] = keying_source
+    return entry, None
 
 
-def _build_entries(records, journal, operations, range_start, range_end):
+def _classify(outcome, journal_by_seq, operations):
+    """Classify one eligible OUTCOME under frozen v1 rules.
+
+    Returns ``(entry_or_None, problem_or_None)``. A keyed entry needs a
+    committed record matching action, argument hash, and journal
+    sequence. Anything else is unresolved or inconsistent; keying is
+    never inferred. The token-id prefix is deliberately ignored: it is
+    non-unique and its rows are purged or cleared while operation
+    records survive, so it cannot serve as join evidence. The legacy
+    join guard is a no-op on the marker-free histories v1 accepts.
+    """
+    action, arg_hash, journal_seq, journal, problem = _journal_link(
+        outcome, journal_by_seq
+    )
+    if problem is not None:
+        return None, problem
+    return _legacy_join(
+        outcome["seq"], action, arg_hash, journal_seq, journal,
+        operations, outcome.get("policy_version"), None,
+    )
+
+
+def _classify_v2(outcome, journal_by_seq, operations, records):
+    """Classify one eligible OUTCOME under v2 rules.
+
+    Marker-bearing records use the shared Slice B helpers against the
+    COMPLETE operation registry and audit history (never a range
+    slice); marker-absent records use the guarded legacy join, which
+    cannot consume Slice B receipts. Returns
+    ``(entry_or_None, problem_or_None)``.
+    """
+    seq = outcome["seq"]
+    action, arg_hash, journal_seq, journal, problem = _journal_link(
+        outcome, journal_by_seq
+    )
+    if problem is not None:
+        return None, problem
+    state, detail = outcome_keying_state(outcome)
+    if state == "malformed":
+        return None, _problem(detail, audit_seq=seq)
+    if state == "keyed":
+        problem = check_keyed_outcome(
+            outcome, detail, operations, records
+        )
+        if problem is not None:
+            return None, _problem(
+                problem, audit_seq=seq, key=detail
+            )
+        record = next(
+            item for item in operations
+            if isinstance(item, dict) and item.get("key") == detail
+        )
+        receipt = record["receipt"]
+        digest = _digest(receipt)
+        if digest is None:
+            return None, _problem(
+                "bad_receipt_shape", key=detail, audit_seq=seq
+            )
+        return {
+            "audit_seq": seq,
+            "op_key": detail,
+            "action": action,
+            "arg_hash": arg_hash,
+            "journal_seq": journal_seq,
+            "receipt_digest": digest,
+            "policy_version": receipt.get("policy_version"),
+            "source": receipt.get("source"),
+            "target": receipt.get("target"),
+            "amount": receipt.get("amount"),
+            "source_balance": receipt.get("source_balance"),
+            "target_balance": receipt.get("target_balance"),
+            "classification": "keyed",
+            "keying_source": "marker",
+        }, None
+    if state == "keyless":
+        problem = check_keyless_outcome(outcome, operations)
+        if problem is not None:
+            return None, _problem(problem, audit_seq=seq)
+        return {
+            "audit_seq": seq,
+            "action": action,
+            "arg_hash": arg_hash,
+            "journal_seq": journal_seq,
+            "policy_version": outcome.get("policy_version"),
+            "source": journal.source,
+            "target": journal.target,
+            "amount": journal.amount,
+            "classification": "keyless",
+            "keying_source": "marker",
+        }, None
+    return _legacy_join(
+        seq, action, arg_hash, journal_seq, journal,
+        operations, outcome.get("policy_version"), "legacy-join",
+    )
+
+
+def _build_entries(records, journal, operations, range_start, range_end,
+                   version):
     """Return ``(entries, problems)`` for the eligible OUTCOME set."""
     journal_by_seq = {entry.seq: entry for entry in journal}
     entries = []
     problems = []
     for outcome in _eligible_outcomes(records, range_start, range_end):
-        entry, problem = _classify(outcome, journal_by_seq, operations)
+        if version == MANIFEST_VERSION_V2:
+            entry, problem = _classify_v2(
+                outcome, journal_by_seq, operations, records
+            )
+        else:
+            entry, problem = _classify(
+                outcome, journal_by_seq, operations
+            )
         if problem is not None:
             problems.append(problem)
         else:
@@ -329,20 +526,25 @@ def _duplicate_keys(operations):
     return sorted(dupes)
 
 
-def _assemble(range_start, range_end, entries):
+def _assemble(version, range_start, range_end, entries):
     """Assemble a manifest dict; raises if entries are unencodable."""
     keyed = sum(1 for e in entries if e["classification"] == "keyed")
+    keyless = sum(
+        1 for e in entries if e["classification"] == "keyless"
+    )
     root = _digest(entries)
     if root is None:
         raise ManifestError("unencodable_entries", {})
     header = {
-        "format_version": MANIFEST_VERSION,
+        "format_version": version,
         "range_start": range_start,
         "range_end": range_end,
         "op_count": len(entries),
         "keyed_count": keyed,
-        "unresolved_count": len(entries) - keyed,
+        "unresolved_count": len(entries) - keyed - keyless,
     }
+    if version == MANIFEST_VERSION_V2:
+        header["keyless_count"] = keyless
     digest = _digest(dict(header, entries_root=root))
     if digest is None:  # unreachable: header holds only ints and strs
         raise ManifestError("unencodable_entries", {})
@@ -354,22 +556,33 @@ def _assemble(range_start, range_end, entries):
 
 def build_manifest(
     audit_records, journal_entries, operations, *,
-    range_start, range_end,
+    range_start, range_end, format_version=MANIFEST_VERSION_V2,
 ):
     """Build a manifest over ``[range_start, range_end]``.
 
+    Caller precondition: the supplied records, journal, and
+    operations must be the COMPLETE local history (operations
+    including pending rows); the range scopes enumeration only.
+    Completeness cannot be proven from snapshots alone.
+
     Raises :class:`ManifestError` when the range cannot be enumerated
     faithfully: uncovered range, duplicate operation keys, duplicate
-    operation linkage, journal gaps, malformed outcome shapes, or
-    unencodable entry values. The audit chain, reconciliation,
-    cross-checks, and receipt-value bindings are not established here;
-    verification establishes them. Unresolved classifications are
-    entries, not errors.
+    operation linkage, journal gaps, malformed outcome shapes,
+    keying-identity failures (v2), or unencodable entry values. The
+    audit chain, reconciliation, cross-checks, and receipt-value
+    bindings are not established here; verification establishes them.
+    Unresolved classifications are entries, not errors. Version 1 is
+    explicit opt-in and refuses marker-bearing histories.
     """
     records = _require_records(audit_records)
     journal = _require_journal(journal_entries)
     ops = _require_operations(operations)
     _require_range(range_start, range_end)
+    version = _require_version(format_version)
+    if version == MANIFEST_VERSION and _history_has_markers(
+        records, ops
+    ):
+        raise ManifestError("marker_history_requires_v2", {})
     covered = {
         record["seq"]
         for record in records
@@ -392,7 +605,7 @@ def build_manifest(
     if dupes:
         raise ManifestError("duplicate_operation_key", {"key": dupes[0]})
     entries, problems = _build_entries(
-        records, journal, ops, range_start, range_end
+        records, journal, ops, range_start, range_end, version
     )
     if problems:
         first = problems[0]
@@ -400,7 +613,7 @@ def build_manifest(
             first["code"],
             {k: v for k, v in first.items() if k != "code"},
         )
-    return _assemble(range_start, range_end, entries)
+    return _assemble(version, range_start, range_end, entries)
 
 
 def _require_balances(opening_balances, ledger_snapshot):
@@ -462,6 +675,21 @@ def _check_operations(ops, journal, records, problems):
             problems.append(
                 _problem(problem, key=record.get("key"))
             )
+    # Reverse identity-position check over every committed receipt
+    # (same two-loop structure as startup verification). Legacy
+    # receipts return None, so this loop is provably empty on the
+    # marker-free histories v1 accepts; shape-invalid rows were
+    # already reported above and are skipped here to avoid doubles.
+    for record in ops:
+        if record.get("status") != "committed":
+            continue
+        if not _record_shape_valid(record):
+            continue
+        problem = check_receipt_keying(record, records)
+        if problem is not None:
+            problems.append(
+                _problem(problem, key=record.get("key"))
+            )
 
 
 def _check_entries(expected, presented, problems):
@@ -503,7 +731,7 @@ def _check_entries(expected, presented, problems):
             )
 
 
-def _check_digests(manifest, problems):
+def _check_digests(manifest, version, problems):
     """Check presented digest self-consistency (not correctness)."""
     root = _digest(list(manifest["entries"]))
     if root is None:
@@ -520,6 +748,8 @@ def _check_digests(manifest, problems):
         "unresolved_count": manifest["unresolved_count"],
         "entries_root": manifest["entries_root"],
     }
+    if version == MANIFEST_VERSION_V2:
+        header["keyless_count"] = manifest["keyless_count"]
     digest = _digest(header)
     if digest is None or digest != manifest["manifest_digest"]:
         problems.append(
@@ -530,20 +760,32 @@ def _check_digests(manifest, problems):
 def verify_local_consistency(
     manifest, audit_records, journal_entries, operations, *,
     opening_balances=None, ledger_snapshot=None,
+    allow_legacy_v1=False,
 ):
     """Verify a presented manifest against local evidence.
+
+    Caller precondition: the supplied records, journal, and
+    operations must be the COMPLETE local history (operations
+    including pending rows); the manifest range scopes enumeration
+    only. Completeness cannot be proven from snapshots alone.
 
     Returns a result dict with independent ``ch`` and ``co`` claims.
     ``ch: pass`` means local enumeration consistency only. ``co`` is
     always ``unresolved``: this slice has no independent occurrence
     evidence. Raises :class:`ManifestError` solely for malformed
-    input shapes; every content finding is a problem code.
+    input shapes; every content finding is a problem code. Version 1
+    manifests require explicit ``allow_legacy_v1`` and refuse
+    marker-bearing histories; the applied rules are always labelled.
     """
-    _require_manifest(manifest)
+    version = _require_manifest(manifest, allow_legacy_v1)
     records = _require_records(audit_records)
     journal = _require_journal(journal_entries)
     ops = _require_operations(operations)
     problems = []
+    if version == MANIFEST_VERSION and _history_has_markers(
+        records, ops
+    ):
+        problems.append(_problem("marker_history_requires_v2"))
     range_start = manifest["range_start"]
     range_end = manifest["range_end"]
     history_ok = _check_history(records, problems)
@@ -581,36 +823,60 @@ def verify_local_consistency(
             problems.append(_problem("reconcile_dirty"))
     _check_operations(ops, journal, records, problems)
     expected, entry_problems = _build_entries(
-        records, journal, ops, range_start, range_end
+        records, journal, ops, range_start, range_end, version
     )
     problems.extend(entry_problems)
     presented = list(manifest["entries"])
-    if (
-        manifest["op_count"] != len(presented)
-        or manifest["keyed_count"]
-        != sum(1 for e in presented if e.get("classification") == "keyed")
-        or manifest["unresolved_count"]
-        != sum(
+    counts_ok = (
+        manifest["op_count"] == len(presented)
+        and manifest["keyed_count"]
+        == sum(1 for e in presented if e.get("classification") == "keyed")
+        and manifest["unresolved_count"]
+        == sum(
             1 for e in presented
             if e.get("classification") == "unresolved"
         )
-    ):
+    )
+    if version == MANIFEST_VERSION_V2:
+        counts_ok = counts_ok and (
+            manifest["keyless_count"]
+            == sum(
+                1 for e in presented
+                if e.get("classification") == "keyless"
+            )
+        )
+    if not counts_ok:
         problems.append(_problem("manifest_count_mismatch"))
-    _check_digests(manifest, problems)
+    _check_digests(manifest, version, problems)
     _check_entries(expected, presented, problems)
     unresolved = [
         entry["audit_seq"] for entry in expected
         if entry["classification"] == "unresolved"
     ]
-    return {
-        "ch": "fail" if problems else "pass",
+    ch_ok = not problems
+    if version == MANIFEST_VERSION_V2:
+        exact_ids = ch_ok and all(
+            "op_key" in entry for entry in expected
+        )
+    else:
+        exact_ids = ch_ok and not unresolved
+    result = {
+        "rules": (
+            "v2" if version == MANIFEST_VERSION_V2 else "v1-legacy"
+        ),
+        "ch": "pass" if ch_ok else "fail",
         "ch_problems": problems,
         "co": CO_UNRESOLVED,
         "co_reason": CO_REASON_NO_EVIDENCE,
         "entries": copy.deepcopy(presented),
         "unresolved_entries": unresolved,
-        "exact_ids_available": not problems and not unresolved,
+        "exact_ids_available": exact_ids,
         "manifest_digest": manifest["manifest_digest"],
         "deployment_bound": False,
         "reconcile_checked": reconcile_checked,
     }
+    if version == MANIFEST_VERSION_V2:
+        result["identity_dispositions_complete"] = (
+            ch_ok and not unresolved
+        )
+    return result

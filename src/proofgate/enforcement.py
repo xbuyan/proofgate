@@ -51,6 +51,7 @@ from .tools import (
     ValidationError,
 )
 from .verify import (
+    check_receipt_keying,
     cross_check_journal_audit,
     operation_receipt_consistent,
     reconcile,
@@ -372,6 +373,19 @@ class Gate:
                 "status": STATUS_ERROR,
                 "reason": REASON_OPERATION_UNVERIFIABLE,
             }
+        problem = check_receipt_keying(
+            record, self._audit.records
+        )
+        if problem is not None:
+            self._set_degraded(
+                "operation_unverifiable",
+                "stored receipt keying inconsistent with evidence: %s"
+                % (problem,),
+            )
+            return {
+                "status": STATUS_ERROR,
+                "reason": REASON_OPERATION_UNVERIFIABLE,
+            }
         try:
             self._record(
                 kind="decision", actor=actor,
@@ -588,18 +602,29 @@ class Gate:
                 "reason": REASON_EXECUTION_FAILED,
             }
         self._storage.add_daily_spent(args["amount"])
+        if op_key is not None:
+            outcome_extra = {
+                "journal_seq": entry.seq,
+                "source_balance": new_source,
+                "target_balance": new_target,
+                "keyed": True,
+                "op_key": op_key,
+            }
+        else:
+            outcome_extra = {
+                "journal_seq": entry.seq,
+                "source_balance": new_source,
+                "target_balance": new_target,
+                "keyed": False,
+            }
         try:
-            self._record(
+            outcome_record = self._record(
                 kind="outcome", actor=actor, action=ACTION_TRANSFER,
                 arg_hash=digest,
                 policy_version=self._storage.get_policy().version,
                 decision=STATUS_ALLOWED, reason=REASON_OK,
                 token_id=token_id,
-                extra={
-                    "journal_seq": entry.seq,
-                    "source_balance": new_source,
-                    "target_balance": new_target,
-                },
+                extra=outcome_extra,
             )
         except AuditError:
             self._set_degraded(
@@ -616,6 +641,29 @@ class Gate:
                 "target": args["target"],
                 "amount": args["amount"],
             }
+        if op_key is not None:
+            outcome_seq = (
+                outcome_record.get("seq")
+                if isinstance(outcome_record, dict) else None
+            )
+            if (
+                not isinstance(outcome_seq, int)
+                or isinstance(outcome_seq, bool)
+                or outcome_seq < 1
+            ):
+                self._set_degraded(
+                    "outcome_unrecorded",
+                    "OUTCOME seq evidence unusable; receipt withheld",
+                    journal_seq=entry.seq,
+                )
+                return {
+                    "status": STATUS_EXECUTED_RECORDING_FAILED,
+                    "reason": REASON_OUTCOME_UNRECORDED,
+                    "journal_seq": entry.seq,
+                    "source": args["source"],
+                    "target": args["target"],
+                    "amount": args["amount"],
+                }
         receipt = {
             "action": ACTION_TRANSFER,
             "source": args["source"],
@@ -627,6 +675,8 @@ class Gate:
             "policy_version": self._storage.get_policy().version,
         }
         if op_key is not None:
+            receipt["op_key"] = op_key
+            receipt["audit_seq"] = outcome_seq
             # Atomic with everything above: the committed outcome
             # and its receipt land in the same transaction as the
             # consumption, journal, ledger, and audit writes.
@@ -868,6 +918,14 @@ class Gate:
                     record["action"], record["arg_hash"],
                     record["receipt"], self._journal.entries(),
                     self._audit.records,
+                )
+                if problem is not None:
+                    return {
+                        "status": STATUS_ERROR,
+                        "reason": REASON_OPERATION_UNVERIFIABLE,
+                    }
+                problem = check_receipt_keying(
+                    record, self._audit.records
                 )
                 if problem is not None:
                     return {
