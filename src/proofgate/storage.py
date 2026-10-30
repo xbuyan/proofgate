@@ -94,6 +94,15 @@ class StorageBackend(abc.ABC):
         """Attach *op_key* to an unlinked token; fail closed."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def list_operations(self):
+        """Return all operation records ordered by key.
+
+        Defensive copies with read-only snapshot semantics. No
+        transaction required.
+        """
+        raise NotImplementedError
+
 
 class MemoryBackend(StorageBackend):
     """In-memory backend: current prototype behavior, unchanged."""
@@ -206,3 +215,10 @@ class MemoryBackend(StorageBackend):
                 "token cannot be linked to an operation"
             )
         entry.op_key = op_key
+
+    def list_operations(self):
+        """Return all operation records ordered by key (copies)."""
+        return [
+            copy.deepcopy(self._operations[key])
+            for key in sorted(self._operations)
+        ]

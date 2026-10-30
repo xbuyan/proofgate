@@ -1364,6 +1364,21 @@ class SQLiteBackend(StorageBackend):
                 "token cannot be linked to an operation"
             )
 
+    def list_operations(self):
+        """Return all operation records ordered by key.
+
+        Fresh dicts per row. An unparseable stored receipt fails
+        closed, matching :meth:`get_operation`.
+        """
+        return [
+            self._operation_from_row(row)
+            for row in self._conn.execute(
+                "SELECT op_key, action, arg_hash, actor, status, "
+                "receipt_json, created_epoch, updated_epoch "
+                "FROM operations ORDER BY op_key"
+            )
+        ]
+
     def _next_seq(self, name):
         self._require_transaction()
         row = self._conn.execute(
