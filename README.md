@@ -135,6 +135,16 @@ absence from this ledger is not proof an external action never ran.
   database and its backups. This detects nothing if an attacker can
   replace or falsify both artifacts, and it claims no protection
   against arbitrary host-level tampering.
+  The regression test
+  `test_host_level_rollback_of_database_and_checkpoint_pair` demonstrates
+  this boundary: restoring a matching older database and local checkpoint
+  is accepted at startup, after which startup appends a new boot-epoch
+  record. That new record does not recover the rolled-back operations.
+  Protection against this coordinated rollback requires a freshness anchor
+  that the host attacker cannot independently restore or falsify; its
+  administration, authentication, and failure behavior must be specified
+  separately. This test does not establish protection against an attacker
+  who can also control that independent anchor or its credentials.
 - Files exist only as read-only `export_jsonl` snapshots derived from the
   authoritative list, so two stores can never disagree. `verify_export`
   additionally detects torn trailing lines.

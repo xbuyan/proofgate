@@ -168,6 +168,61 @@ class RollbackDetectionTests(CheckpointCase):
             self.assertEqual(json.load(fh)["audit_seq"],
                              checkpoint["audit_seq"])
 
+    def test_host_level_rollback_of_database_and_checkpoint_pair(self):
+        gate, backend = self.make_gate()
+        self.keyed_transfer(self, gate, "host-t1", transfer_args())
+
+        seq, digest = self.head_of(backend)
+        backend.checkpoint(
+            self.path("c.json"),
+            deployment_id=DEPLOYMENT,
+            expected_seq=seq,
+            expected_hash=digest,
+        )
+
+        # Preserve a matching old database + checkpoint pair.
+        backend.backup(self.path("old.db"))
+        shutil.copyfile(self.path("c.json"), self.path("old.json"))
+        old_checkpoint = read_checkpoint(self.path("old.json"))
+
+        # Advance the live database and checkpoint beyond that pair.
+        self.keyed_transfer(self, gate, "host-t2", transfer_args(50))
+        # Advance the existing checkpoint using its established head.
+        backend.checkpoint(
+            self.path("c.json"),
+            deployment_id=DEPLOYMENT,
+        )
+        backend.close()
+
+        # Simulate a host attacker restoring both old local files.
+        self.restore("old.db")
+        shutil.copyfile(self.path("old.json"), self.path("c.json"))
+
+        # Characterize whether the matching old pair is accepted.
+        reopened = SQLiteBackend.open(
+            self.path(),
+            checkpoint_path=self.path("c.json"),
+            deployment_id=DEPLOYMENT,
+        )
+        self._backends.append(reopened)
+        # Startup accepted the restored pair. Its boot record advances
+        # the head, so verify the saved checkpoint remains in the chain.
+        records = reopened.audit.records
+        matching = [
+            record for record in records
+            if record["seq"] == old_checkpoint["audit_seq"]
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0]["record_hash"],
+            old_checkpoint["audit_hash"],
+        )
+        self.assertGreater(
+            records[-1]["seq"],
+            old_checkpoint["audit_seq"],
+        )
+        reopened.close()
+
     def test_extension_recovery_advances(self):
         gate, backend = self.make_gate()
         self.keyed_transfer(self, gate, "cp-t1", transfer_args())
